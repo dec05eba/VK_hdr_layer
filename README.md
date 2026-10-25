@@ -42,9 +42,22 @@ sudo meson install -C build
    xrandr --output DP-1 --set HDR 1
    ```
    Run `xrandr --prop` to check that the monitor reports `HDR capable: 1`. The `SDR white level` property sets how bright the SDR desktop is shown in HDR mode, in nits.
-2. Start the application with `ENABLE_HDR_WSI=1`.
+2. Start the application with the layer enabled:
+   ```bash
+   ENABLE_HDR_WSI=1 vkcube
+   ```
 3. Run the application fullscreen. The X server treats a window that doesn't cover the monitor as SDR content, so HDR content in it looks washed out.
 
-For Proton/Wine games, set the launch options to `ENABLE_HDR_WSI=1 DXVK_HDR=1 %command%` and enable HDR in the game's settings.
+The layer prints messages prefixed with `[HDR Layer]` to stderr. `Enabling format: ... colorspace: 1000104008` means that HDR10 is offered to the application.
 
 Don't use the layer with applications that set the `hdr_output_metadata` property themselves, such as an mpv build with X11 HDR support.
+
+## Steam
+
+Set the launch options in the game's Properties → General:
+- Native Linux Vulkan games: `ENABLE_HDR_WSI=1 %command%`
+- Proton games: `ENABLE_HDR_WSI=1 DXVK_HDR=1 %command%`. `DXVK_HDR=1` makes DXVK and vkd3d-proton report HDR support to the game.
+
+Then enable HDR in the game's settings.
+
+Direct3D 12 games run through vkd3d-proton, and upstream vkd3d-proton only creates HDR10 swapchains with `VK_FORMAT_A2B10G10R10_UNORM_PACK32`. Vulkan drivers don't offer that format for depth 30 X11 windows, so these games need a vkd3d-proton build that falls back to `VK_FORMAT_A2R10G10B10_UNORM_PACK32`, installed into the Proton build the game uses.
