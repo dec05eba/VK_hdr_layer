@@ -1,13 +1,21 @@
-#define VK_USE_PLATFORM_WAYLAND_KHR
+#define VK_USE_PLATFORM_XCB_KHR
+#define VK_USE_PLATFORM_XLIB_KHR
 #include "vkroots.h"
-#include "color-management-v1-client-protocol.h"
 
+#include <X11/Xlib-xcb.h>
+#include <xcb/randr.h>
+#include <xcb/shape.h>
+#include <xcb/xcbext.h>
+#include <drm/drm_mode.h>
+
+#include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
 #include <optional>
+#include <functional>
 #include <ranges>
 
 using namespace std::literals;
@@ -15,189 +23,435 @@ using namespace std::literals;
 namespace HdrLayer
 {
 
-struct ColorDescription {
-    VkSurfaceFormat2KHR surface;
-    wp_color_manager_v1_primaries primaries;
-    wp_color_manager_v1_transfer_function transferFunction;
-    bool extended_volume;
-};
+static constexpr std::array<VkSurfaceFormatKHR, 2> s_HdrSurfaceFormats = {{
+    { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT },
+    { VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT },
+}};
 
-static std::vector<ColorDescription> s_ExtraHDRSurfaceFormats = {
-    ColorDescription{
-        .surface = {
-            .surfaceFormat = {
-                VK_FORMAT_A2B10G10R10_UNORM_PACK32,
-                VK_COLOR_SPACE_HDR10_ST2084_EXT,
-            }
-        },
-        .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020,
-        .transferFunction = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ,
-        .extended_volume = false,
-    },
-    ColorDescription{
-        .surface = {
-            .surfaceFormat = {
-                VK_FORMAT_A2R10G10B10_UNORM_PACK32,
-                VK_COLOR_SPACE_HDR10_ST2084_EXT,
-            }
-        },
-        .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_BT2020,
-        .transferFunction = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ,
-        .extended_volume = false,
-    },
-    ColorDescription{
-        .surface = {
-            .surfaceFormat = {
-                VK_FORMAT_R16G16B16A16_SFLOAT,
-                VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT,
-            }
-        },
-        .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
-        .transferFunction = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
-        .extended_volume = true,
-    },
-    ColorDescription{
-        .surface = {
-            .surfaceFormat = {
-                VK_FORMAT_R16G16B16A16_SFLOAT,
-                VK_COLOR_SPACE_BT709_LINEAR_EXT,
-            }
-        },
-        .primaries = WP_COLOR_MANAGER_V1_PRIMARIES_SRGB,
-        .transferFunction = WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
-        .extended_volume = true,
-    },
-    // ColorDescription{
-    //     .surface = {
-    //         .surfaceFormat = {
-    //             VK_FORMAT_R16G16B16A16_SFLOAT,
-    //             VK_COLOR_SPACE_BT2020_LINEAR_EXT,
-    //         }
-    //     },
-    //     .primaries_cicp = 9,
-    //     .tf_cicp = 8,
-    //     .extended_volume = false,
-    // },
-    // ColorDescription{
-    //     .surface = {
-    //         .surfaceFormat = {
-    //             VK_FORMAT_R16G16B16A16_SFLOAT,
-    //             VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT,
-    //         }
-    //     },
-    //     .primaries_cicp = 13,
-    //     .tf_cicp = 8,
-    //     .extended_volume = false,
-    // },
-    // ColorDescription{
-    //     .surface = {
-    //         .surfaceFormat = {
-    //             VK_FORMAT_A2B10G10R10_UNORM_PACK32,
-    //             VK_COLOR_SPACE_BT709_NONLINEAR_EXT,
-    //         }
-    //     },
-    //     .primaries_cicp = 6,
-    //     .tf_cicp = 6,
-    //     .extended_volume = true,
-    // },
-    // ColorDescription{
-    //     .surface = {
-    //         .surfaceFormat = {
-    //             VK_FORMAT_A2R10G10B10_UNORM_PACK32,
-    //             VK_COLOR_SPACE_BT709_NONLINEAR_EXT,
-    //         }
-    //     },
-    //     .primaries_cicp = 6,
-    //     .tf_cicp = 6,
-    //     .extended_volume = true,
-    // },
+struct X11Output {
+    int x;
+    int y;
+    int width;
+    int height;
+    bool hdr;
 };
 
 struct HdrSurfaceData {
     VkInstance instance;
     bool supportsPassthrough = false;
 
-    wl_display *display;
-    wl_event_queue *queue;
-    wp_color_manager_v1 *colorManager;
+    xcb_connection_t *xcbConnection;
+    xcb_window_t xcbWindow;
+    xcb_window_t xcbRoot;
+    xcb_atom_t hdrMetadataAtom;
+    xcb_atom_t hdrAtom;
+    xcb_atom_t hdrCapableAtom;
 
-    std::vector<wp_color_manager_v1_feature> supportedFeatures;
-    std::vector<wp_color_manager_v1_primaries> supportedPrimaries;
-    std::vector<wp_color_manager_v1_transfer_function> supportedTransferFunctions;
+    xcb_window_t hdrWindow;
+    xcb_colormap_t hdrColormap;
+    VkSurfaceKHR hdrWindowSurface;
+    uint16_t hdrWindowWidth;
+    uint16_t hdrWindowHeight;
 
-    wl_surface *surface;
-    wp_color_management_surface_v1 *colorSurface;
+    int windowX;
+    int windowY;
+    int windowWidth;
+    int windowHeight;
+    unsigned int windowPositionRequest;
+    unsigned int windowGeometryRequest;
+
+    xcb_connection_t *randrEventConnection;
+    uint8_t randrFirstEvent;
+    std::vector<X11Output> outputs;
+    bool outputsDirty;
+    bool hdrAvailable;
 };
 VKROOTS_DEFINE_SYNCHRONIZED_MAP_TYPE(HdrSurface, VkSurfaceKHR);
 
+static constexpr uint8_t HDR_WINDOW_DEPTH = 30;
+
+static bool isTenBitFormat(VkFormat format)
+{
+    return format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+}
+
+static void discardX11Errors(xcb_connection_t *connection, xcb_void_cookie_t cookie)
+{
+    xcb_discard_reply(connection, cookie.sequence);
+}
+
+static bool checkX11Request(xcb_connection_t *connection, xcb_void_cookie_t cookie)
+{
+    xcb_generic_error_t *error = xcb_request_check(connection, cookie);
+    free(error);
+    return error == nullptr;
+}
+
+static xcb_visualid_t findHdrVisual(xcb_connection_t *connection, xcb_window_t root)
+{
+    for (auto screen = xcb_setup_roots_iterator(xcb_get_setup(connection)); screen.rem; xcb_screen_next(&screen)) {
+        if (screen.data->root != root) {
+            continue;
+        }
+        for (auto depth = xcb_screen_allowed_depths_iterator(screen.data); depth.rem; xcb_depth_next(&depth)) {
+            if (depth.data->depth != HDR_WINDOW_DEPTH) {
+                continue;
+            }
+            for (auto visual = xcb_depth_visuals_iterator(depth.data); visual.rem; xcb_visualtype_next(&visual)) {
+                if (visual.data->_class == XCB_VISUAL_CLASS_TRUE_COLOR && visual.data->bits_per_rgb_value == 10) {
+                    return visual.data->visual_id;
+                }
+            }
+        }
+    }
+    return XCB_NONE;
+}
+
+static void resizeX11HdrWindow(HdrSurfaceData &surface, uint16_t width, uint16_t height)
+{
+    width = std::max<uint16_t>(width, 1);
+    height = std::max<uint16_t>(height, 1);
+    if (width == surface.hdrWindowWidth && height == surface.hdrWindowHeight) {
+        return;
+    }
+
+    const uint32_t values[] = { width, height };
+    discardX11Errors(surface.xcbConnection,
+                     xcb_configure_window_checked(surface.xcbConnection, surface.hdrWindow,
+                                                  XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, values));
+    surface.hdrWindowWidth = width;
+    surface.hdrWindowHeight = height;
+}
+
+static void updateX11WindowGeometry(HdrSurfaceData &surface, const xcb_translate_coordinates_reply_t *position,
+                                    const xcb_get_geometry_reply_t *geometry)
+{
+    if (position) {
+        surface.windowX = position->dst_x;
+        surface.windowY = position->dst_y;
+    }
+    if (geometry) {
+        surface.windowWidth = geometry->width;
+        surface.windowHeight = geometry->height;
+        if (surface.hdrWindow) {
+            resizeX11HdrWindow(surface, geometry->width, geometry->height);
+        }
+    }
+}
+
+static void syncX11WindowGeometry(HdrSurfaceData &surface)
+{
+    xcb_connection_t *connection = surface.xcbConnection;
+    const auto positionCookie = xcb_translate_coordinates(connection, surface.xcbWindow, surface.xcbRoot, 0, 0);
+    const auto geometryCookie = xcb_get_geometry(connection, surface.xcbWindow);
+    xcb_translate_coordinates_reply_t *position = xcb_translate_coordinates_reply(connection, positionCookie, nullptr);
+    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(connection, geometryCookie, nullptr);
+    updateX11WindowGeometry(surface, position, geometry);
+    free(position);
+    free(geometry);
+    xcb_flush(connection);
+}
+
+static void setX11HdrWindowMapped(const HdrSurfaceData &surface, bool mapped)
+{
+    xcb_connection_t *connection = surface.xcbConnection;
+    discardX11Errors(connection, mapped ? xcb_map_window_checked(connection, surface.hdrWindow)
+                                        : xcb_unmap_window_checked(connection, surface.hdrWindow));
+    xcb_flush(connection);
+}
+
+static void pollX11WindowGeometry(HdrSurfaceData &surface)
+{
+    xcb_connection_t *connection = surface.xcbConnection;
+    if (surface.windowGeometryRequest) {
+        xcb_translate_coordinates_reply_t *position = nullptr;
+        xcb_get_geometry_reply_t *geometry = nullptr;
+        xcb_generic_error_t *error = nullptr;
+        if (!xcb_poll_for_reply(connection, surface.windowGeometryRequest, reinterpret_cast<void **>(&geometry), &error)) {
+            return;
+        }
+        free(error);
+        error = nullptr;
+        if (!xcb_poll_for_reply(connection, surface.windowPositionRequest, reinterpret_cast<void **>(&position), &error)) {
+            xcb_discard_reply(connection, surface.windowPositionRequest);
+        }
+        free(error);
+        updateX11WindowGeometry(surface, position, geometry);
+        free(position);
+        free(geometry);
+    }
+
+    surface.windowPositionRequest = xcb_translate_coordinates(connection, surface.xcbWindow, surface.xcbRoot, 0, 0).sequence;
+    surface.windowGeometryRequest = xcb_get_geometry(connection, surface.xcbWindow).sequence;
+    xcb_flush(connection);
+}
+
+static bool getX11OutputFlag(xcb_connection_t *connection, xcb_randr_output_t output, xcb_atom_t property)
+{
+    xcb_randr_get_output_property_reply_t *reply = xcb_randr_get_output_property_reply(
+        connection, xcb_randr_get_output_property(connection, output, property, XCB_ATOM_INTEGER, 0, 1, false, false), nullptr);
+    const bool enabled = reply && reply->format == 32 && reply->num_items == 1
+        && *reinterpret_cast<const int32_t *>(xcb_randr_get_output_property_data(reply)) == 1;
+    free(reply);
+    return enabled;
+}
+
+static void readX11Outputs(HdrSurfaceData &surface)
+{
+    xcb_connection_t *connection = surface.xcbConnection;
+    surface.outputs.clear();
+    surface.outputsDirty = false;
+
+    xcb_randr_get_screen_resources_current_reply_t *resources = xcb_randr_get_screen_resources_current_reply(
+        connection, xcb_randr_get_screen_resources_current(connection, surface.xcbRoot), nullptr);
+    if (!resources) {
+        return;
+    }
+
+    const xcb_randr_output_t *outputs = xcb_randr_get_screen_resources_current_outputs(resources);
+    const int numOutputs = xcb_randr_get_screen_resources_current_outputs_length(resources);
+    for (int i = 0; i < numOutputs; i++) {
+        xcb_randr_get_output_info_reply_t *info = xcb_randr_get_output_info_reply(
+            connection, xcb_randr_get_output_info(connection, outputs[i], resources->config_timestamp), nullptr);
+        xcb_randr_get_crtc_info_reply_t *crtc = info && info->crtc
+            ? xcb_randr_get_crtc_info_reply(connection, xcb_randr_get_crtc_info(connection, info->crtc, resources->config_timestamp), nullptr)
+            : nullptr;
+        if (crtc) {
+            surface.outputs.push_back(X11Output{
+                .x = crtc->x,
+                .y = crtc->y,
+                .width = crtc->width,
+                .height = crtc->height,
+                .hdr = getX11OutputFlag(connection, outputs[i], surface.hdrAtom)
+                    && getX11OutputFlag(connection, outputs[i], surface.hdrCapableAtom),
+            });
+        }
+        free(crtc);
+        free(info);
+    }
+    free(resources);
+}
+
+static void openX11RandrEventConnection(HdrSurfaceData &surface)
+{
+    xcb_connection_t *connection = xcb_connect(nullptr, nullptr);
+    const xcb_query_extension_reply_t *randr = xcb_connection_has_error(connection)
+        ? nullptr : xcb_get_extension_data(connection, &xcb_randr_id);
+    if (!randr || !randr->present) {
+        xcb_disconnect(connection);
+        return;
+    }
+
+    xcb_randr_select_input(connection, surface.xcbRoot,
+                           XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE | XCB_RANDR_NOTIFY_MASK_CRTC_CHANGE
+                           | XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE | XCB_RANDR_NOTIFY_MASK_OUTPUT_PROPERTY);
+    xcb_flush(connection);
+    surface.randrEventConnection = connection;
+    surface.randrFirstEvent = randr->first_event;
+}
+
+static void pollX11RandrEvents(HdrSurfaceData &surface)
+{
+    if (!surface.randrEventConnection) {
+        return;
+    }
+    while (xcb_generic_event_t *event = xcb_poll_for_event(surface.randrEventConnection)) {
+        const uint8_t type = event->response_type & ~0x80;
+        if (type == surface.randrFirstEvent + XCB_RANDR_SCREEN_CHANGE_NOTIFY || type == surface.randrFirstEvent + XCB_RANDR_NOTIFY) {
+            surface.outputsDirty = true;
+        }
+        free(event);
+    }
+}
+
+static void updateX11HdrAvailability(HdrSurfaceData &surface)
+{
+    if (!surface.hdrAtom || !surface.hdrCapableAtom) {
+        return;
+    }
+
+    pollX11RandrEvents(surface);
+    if (surface.outputsDirty) {
+        readX11Outputs(surface);
+    }
+
+    bool onOutput = false;
+    surface.hdrAvailable = true;
+    for (const X11Output &output : surface.outputs) {
+        const bool overlaps = surface.windowX < output.x + output.width && output.x < surface.windowX + surface.windowWidth
+            && surface.windowY < output.y + output.height && output.y < surface.windowY + surface.windowHeight;
+        if (overlaps) {
+            onOutput = true;
+            surface.hdrAvailable &= output.hdr;
+        }
+    }
+    surface.hdrAvailable &= onOutput;
+}
+
+static void destroyX11HdrWindow(const HdrSurfaceData &surface)
+{
+    xcb_connection_t *connection = surface.xcbConnection;
+    discardX11Errors(connection, xcb_destroy_window_checked(connection, surface.hdrWindow));
+    discardX11Errors(connection, xcb_free_colormap_checked(connection, surface.hdrColormap));
+    xcb_flush(connection);
+}
+
+static void setX11HdrMetadata(const HdrSurfaceData &surface, const hdr_output_metadata *metadata)
+{
+    const xcb_window_t window = surface.hdrWindow ? surface.hdrWindow : surface.xcbWindow;
+    const auto cookie = metadata
+        ? xcb_change_property_checked(surface.xcbConnection, XCB_PROP_MODE_REPLACE, window,
+                                      surface.hdrMetadataAtom, XCB_ATOM_CARDINAL, 8, sizeof(*metadata), metadata)
+        : xcb_delete_property_checked(surface.xcbConnection, window, surface.hdrMetadataAtom);
+    discardX11Errors(surface.xcbConnection, cookie);
+    xcb_flush(surface.xcbConnection);
+}
+
+static void destroyX11Surface(const HdrSurfaceData &surface)
+{
+    if (surface.windowGeometryRequest) {
+        xcb_discard_reply(surface.xcbConnection, surface.windowPositionRequest);
+        xcb_discard_reply(surface.xcbConnection, surface.windowGeometryRequest);
+    }
+    if (surface.hdrWindow) {
+        destroyX11HdrWindow(surface);
+    } else {
+        setX11HdrMetadata(surface, nullptr);
+    }
+    if (surface.randrEventConnection) {
+        xcb_disconnect(surface.randrEventConnection);
+    }
+}
+
+static VkResult getDriverSurfaceFormats(const vkroots::VkInstanceDispatch *pDispatch, VkPhysicalDevice physicalDevice,
+                                        VkSurfaceKHR surface, std::vector<VkSurfaceFormatKHR> &formats)
+{
+    uint32_t count = 0;
+    VkResult result = pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &count, nullptr);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    formats.resize(count);
+    result = pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &count, formats.data());
+    formats.resize(count);
+    return result;
+}
+
+static std::vector<VkSurfaceFormatKHR> getHdrFormats(HdrSurfaceData &surface, const std::vector<VkSurfaceFormatKHR> &formats)
+{
+    surface.supportsPassthrough = std::ranges::any_of(formats, [](const VkSurfaceFormatKHR fmt) {
+        return fmt.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT;
+    });
+
+    std::vector<VkSurfaceFormatKHR> hdrFormats = {};
+    if (!surface.hdrAvailable) {
+        return hdrFormats;
+    }
+
+    for (const VkSurfaceFormatKHR &hdrFormat : s_HdrSurfaceFormats) {
+        const bool alreadySupported = std::ranges::any_of(formats, [&hdrFormat](const VkSurfaceFormatKHR fmt) {
+            return fmt.format == hdrFormat.format && fmt.colorSpace == hdrFormat.colorSpace;
+        });
+        const bool hasFormat = std::ranges::any_of(formats, [&hdrFormat](const VkSurfaceFormatKHR fmt) {
+            return fmt.format == hdrFormat.format;
+        });
+        if (!alreadySupported && hasFormat) {
+            fprintf(stderr, "[HDR Layer] Enabling format: %u colorspace: %u\n", hdrFormat.format, hdrFormat.colorSpace);
+            hdrFormats.push_back(hdrFormat);
+        }
+    }
+    return hdrFormats;
+}
+
+static VkResult getHdrSurfaceExtraFormats(const vkroots::VkInstanceDispatch *pDispatch, VkPhysicalDevice physicalDevice,
+                                          VkSurfaceKHR surface, HdrSurfaceData &hdrSurface,
+                                          std::vector<VkSurfaceFormatKHR> &extraFormats)
+{
+    std::vector<VkSurfaceFormatKHR> formats;
+    VkResult result = getDriverSurfaceFormats(pDispatch, physicalDevice, surface, formats);
+    if (result < 0) {
+        return result;
+    }
+
+    syncX11WindowGeometry(hdrSurface);
+    updateX11HdrAvailability(hdrSurface);
+
+    if (hdrSurface.hdrWindowSurface) {
+        std::vector<VkSurfaceFormatKHR> hdrWindowFormats;
+        result = getDriverSurfaceFormats(pDispatch, physicalDevice, hdrSurface.hdrWindowSurface, hdrWindowFormats);
+        if (result < 0) {
+            return result;
+        }
+        for (const auto &hdrWindowFormat : hdrWindowFormats) {
+            const bool duplicate = std::ranges::any_of(formats, [&hdrWindowFormat](const VkSurfaceFormatKHR fmt) {
+                return fmt.format == hdrWindowFormat.format && fmt.colorSpace == hdrWindowFormat.colorSpace;
+            });
+            if (!duplicate) {
+                extraFormats.push_back(hdrWindowFormat);
+            }
+        }
+        formats.insert(formats.end(), extraFormats.begin(), extraFormats.end());
+    }
+
+    const std::vector<VkSurfaceFormatKHR> hdrFormats = getHdrFormats(hdrSurface, formats);
+    extraFormats.insert(extraFormats.end(), hdrFormats.begin(), hdrFormats.end());
+    return VK_SUCCESS;
+}
+
 struct HdrSwapchainData {
     VkSurfaceKHR surface;
-
-    wp_color_manager_v1_primaries primaries;
-    wp_color_manager_v1_transfer_function transferFunction;
-    bool untagged = false;
+    VkSurfaceKHR driverSurface;
+    bool usesHdrWindow = false;
+    bool hdrAvailable = false;
+    bool hdr10 = false;
 
     VkHdrMetadataEXT metadata;
-    bool desc_dirty;
+    bool metadataDirty;
 };
 VKROOTS_DEFINE_SYNCHRONIZED_MAP_TYPE(HdrSwapchain, VkSwapchainKHR);
-
-enum DescStatus {
-    WAITING,
-    READY,
-    FAILED,
-};
 
 class VkInstanceOverrides
 {
 public:
-    static VkResult CreateWaylandSurfaceKHR(
+    static VkResult CreateXcbSurfaceKHR(
         const vkroots::VkInstanceDispatch *pDispatch,
         VkInstance instance,
-        const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
+        const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
         const VkAllocationCallbacks *pAllocator,
         VkSurfaceKHR *pSurface)
     {
-        auto queue = wl_display_create_queue(pCreateInfo->display);
-        wl_registry *registry = wl_display_get_registry(pCreateInfo->display);
-        wl_proxy_set_queue(reinterpret_cast<wl_proxy *>(registry), queue);
-
-        VkResult res = pDispatch->CreateWaylandSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+        VkResult res = pDispatch->CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
         if (res != VK_SUCCESS) {
             return res;
         }
 
-        auto hdrSurface = HdrSurface::create(*pSurface, HdrSurfaceData{
-            .instance = instance,
-            .supportsPassthrough = false,
-            .display = pCreateInfo->display,
-            .queue = queue,
-            .colorManager = nullptr,
-            .surface = pCreateInfo->surface,
-            .colorSurface = nullptr,
+        createX11HdrSurface(instance, *pSurface, pCreateInfo->connection, pCreateInfo->window,
+                            [&](xcb_window_t window, VkSurfaceKHR *surface) {
+            VkXcbSurfaceCreateInfoKHR info = *pCreateInfo;
+            info.window = window;
+            return pDispatch->CreateXcbSurfaceKHR(instance, &info, pAllocator, surface);
         });
+        return VK_SUCCESS;
+    }
 
-        wl_registry_add_listener(registry, &s_registryListener, reinterpret_cast<void *>(hdrSurface.get()));
-        wl_display_dispatch_queue(pCreateInfo->display, queue);
-        wl_display_roundtrip_queue(pCreateInfo->display, queue); // get globals
-        wl_display_roundtrip_queue(pCreateInfo->display, queue); // get features/supported_cicps/etc
-        wl_registry_destroy(registry);
-
-        if (!hdrSurface->colorManager) {
-            fprintf(stderr, "[HDR Layer] wayland compositor is lacking support for the color management protocol..\n");
-
-            HdrSurface::remove(*pSurface);
-            return VK_SUCCESS;
+    static VkResult CreateXlibSurfaceKHR(
+        const vkroots::VkInstanceDispatch *pDispatch,
+        VkInstance instance,
+        const VkXlibSurfaceCreateInfoKHR *pCreateInfo,
+        const VkAllocationCallbacks *pAllocator,
+        VkSurfaceKHR *pSurface)
+    {
+        VkResult res = pDispatch->CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+        if (res != VK_SUCCESS) {
+            return res;
         }
 
-        const bool hasParametric = std::ranges::find(hdrSurface->supportedFeatures, WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC) != hdrSurface->supportedFeatures.end();
-        if (!hasParametric) {
-            fprintf(stderr, "[HDR Layer] wayland compositor is lacking support for parametric image descriptions\n");
-            HdrSurface::remove(*pSurface);
-            return VK_SUCCESS;
-        }
-
-        fprintf(stderr, "[HDR Layer] Created HDR surface\n");
+        createX11HdrSurface(instance, *pSurface, XGetXCBConnection(pCreateInfo->dpy), pCreateInfo->window,
+                            [&](xcb_window_t window, VkSurfaceKHR *surface) {
+            VkXlibSurfaceCreateInfoKHR info = *pCreateInfo;
+            info.window = window;
+            return pDispatch->CreateXlibSurfaceKHR(instance, &info, pAllocator, surface);
+        });
         return VK_SUCCESS;
     }
 
@@ -212,52 +466,10 @@ public:
         if (!hdrSurface)
             return pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, pSurfaceFormatCount, pSurfaceFormats);
 
-        uint32_t count = 0;
-        auto result = pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &count, nullptr);
-        if (result != VK_SUCCESS) {
+        std::vector<VkSurfaceFormatKHR> extraFormats;
+        const VkResult result = getHdrSurfaceExtraFormats(pDispatch, physicalDevice, surface, *hdrSurface.get(), extraFormats);
+        if (result < 0) {
             return result;
-        }
-        std::vector<VkSurfaceFormatKHR> formats(count);
-        result = pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &count, formats.data());
-        if (result != VK_SUCCESS) {
-            return result;
-        }
-
-        hdrSurface->supportsPassthrough = std::ranges::any_of(formats, [](const VkSurfaceFormatKHR fmt) {
-            return fmt.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT;
-        });
-
-        std::vector<VkSurfaceFormatKHR> extraFormats = {};
-        for (const auto &desc : s_ExtraHDRSurfaceFormats) {
-            const bool alreadySupportsColorspace = std::ranges::any_of(formats, [&desc](const VkSurfaceFormatKHR fmt) {
-                return desc.surface.surfaceFormat.format == fmt.format
-                    && desc.surface.surfaceFormat.colorSpace == fmt.colorSpace;
-            });
-            if (alreadySupportsColorspace) {
-                continue;
-            }
-            bool hasFormat = std::ranges::any_of(formats, [&desc](const VkSurfaceFormatKHR fmt) {
-                return desc.surface.surfaceFormat.format == fmt.format;
-            });
-            hasFormat &= std::ranges::find(hdrSurface->supportedPrimaries, desc.primaries) != hdrSurface->supportedPrimaries.end();
-            hasFormat &= std::ranges::find(hdrSurface->supportedTransferFunctions, desc.transferFunction) != hdrSurface->supportedTransferFunctions.end();
-            hasFormat &= !desc.extended_volume || std::ranges::find(hdrSurface->supportedFeatures, WP_COLOR_MANAGER_V1_FEATURE_EXTENDED_TARGET_VOLUME) != hdrSurface->supportedFeatures.end();
-            if (hasFormat) {
-                fprintf(stderr, "[HDR Layer] Enabling format: %u colorspace: %u\n", desc.surface.surfaceFormat.format, desc.surface.surfaceFormat.colorSpace);
-                extraFormats.push_back(desc.surface.surfaceFormat);
-            }
-        }
-        std::unordered_map<VkFormat, bool> passthrough;
-        for (const auto &format : formats) {
-            passthrough[format.format] |= format.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT;
-        }
-        for (const auto &[format, hasPassthrough] : passthrough) {
-            if (!hasPassthrough) {
-                extraFormats.push_back(VkSurfaceFormatKHR{
-                    .format = format,
-                    .colorSpace = VK_COLOR_SPACE_PASS_THROUGH_EXT,
-                });
-            }
         }
 
         return vkroots::helpers::append(
@@ -281,55 +493,19 @@ public:
             return pDispatch->GetPhysicalDeviceSurfaceFormats2KHR(physicalDevice, pSurfaceInfo, pSurfaceFormatCount, pSurfaceFormats);
         }
 
-        uint32_t count = 0;
-        auto result = pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, pSurfaceInfo->surface, &count, nullptr);
-        if (result != VK_SUCCESS) {
+        std::vector<VkSurfaceFormatKHR> extraSurfaceFormats;
+        const VkResult result = getHdrSurfaceExtraFormats(pDispatch, physicalDevice, pSurfaceInfo->surface, *hdrSurface.get(), extraSurfaceFormats);
+        if (result < 0) {
             return result;
         }
-        std::vector<VkSurfaceFormatKHR> formats(count);
-        result = pDispatch->GetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, pSurfaceInfo->surface, &count, formats.data());
-        if (result != VK_SUCCESS) {
-            return result;
-        }
-
-        hdrSurface->supportsPassthrough = std::ranges::any_of(formats, [](const VkSurfaceFormatKHR fmt) {
-            return fmt.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT;
-        });
 
         std::vector<VkSurfaceFormat2KHR> extraFormats = {};
-        for (const auto &desc : s_ExtraHDRSurfaceFormats) {
-            const bool alreadySupportsColorspace = std::ranges::any_of(formats, [&desc](const VkSurfaceFormatKHR fmt) {
-                return desc.surface.surfaceFormat.format == fmt.format
-                    && desc.surface.surfaceFormat.colorSpace == fmt.colorSpace;
+        for (const auto &format : extraSurfaceFormats) {
+            extraFormats.push_back(VkSurfaceFormat2KHR{
+                .sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR,
+                .pNext = nullptr,
+                .surfaceFormat = format,
             });
-            if (alreadySupportsColorspace) {
-                continue;
-            }
-            bool hasFormat = std::ranges::any_of(formats, [&desc](const VkSurfaceFormatKHR fmt) {
-                return desc.surface.surfaceFormat.format == fmt.format;
-            });
-            hasFormat &= std::ranges::find(hdrSurface->supportedPrimaries, desc.primaries) != hdrSurface->supportedPrimaries.end();
-            hasFormat &= std::ranges::find(hdrSurface->supportedTransferFunctions, desc.transferFunction) != hdrSurface->supportedTransferFunctions.end();
-            if (hasFormat) {
-                fprintf(stderr, "[HDR Layer] Enabling format: %u colorspace: %u\n", desc.surface.surfaceFormat.format, desc.surface.surfaceFormat.colorSpace);
-                extraFormats.push_back(desc.surface);
-            }
-        }
-        std::unordered_map<VkFormat, bool> passthrough;
-        for (const auto &format : formats) {
-            passthrough[format.format] |= format.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT;
-        }
-        for (const auto &[format, hasPassthrough] : passthrough) {
-            if (!hasPassthrough) {
-                extraFormats.push_back(VkSurfaceFormat2KHR{
-                    .sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR,
-                    .pNext = nullptr,
-                    .surfaceFormat= {
-                        .format = format,
-                        .colorSpace = VK_COLOR_SPACE_PASS_THROUGH_EXT,
-                    },
-                });
-            }
         }
 
         return vkroots::helpers::append(
@@ -348,13 +524,10 @@ public:
         const VkAllocationCallbacks *pAllocator)
     {
         if (auto state = HdrSurface::get(surface)) {
-            if (state->colorSurface) {
-                wp_color_management_surface_v1_destroy(state->colorSurface);
+            if (state->hdrWindow) {
+                pDispatch->DestroySurfaceKHR(instance, state->hdrWindowSurface, pAllocator);
             }
-            if (state->colorManager) {
-                wp_color_manager_v1_destroy(state->colorManager);
-            }
-            wl_event_queue_destroy(state->queue);
+            destroyX11Surface(*state.get());
         }
         HdrSurface::remove(surface);
         pDispatch->DestroySurfaceKHR(instance, surface, pAllocator);
@@ -394,44 +567,96 @@ public:
     }
 
 private:
-    static constexpr wp_color_manager_v1_listener s_colorManagerListener {
-        .supported_intent = [](void *data, wp_color_manager_v1 *wp_color_manager_v4, uint32_t render_intent) {
-        },
-        .supported_feature = [](void *data, wp_color_manager_v1 *wp_color_manager_v4, uint32_t feature) {
-            reinterpret_cast<HdrSurfaceData *>(data)->supportedFeatures.push_back(wp_color_manager_v1_feature(feature));
-        },
-        .supported_tf_named = [](void *data, wp_color_manager_v1 *wp_color_manager_v4, uint32_t tf) {
-            reinterpret_cast<HdrSurfaceData *>(data)->supportedTransferFunctions.push_back(wp_color_manager_v1_transfer_function(tf));
-        },
-        .supported_primaries_named = [](void *data, wp_color_manager_v1 *wp_color_manager_v4, uint32_t primaries) {
-            reinterpret_cast<HdrSurfaceData *>(data)->supportedPrimaries.push_back(wp_color_manager_v1_primaries(primaries));
-        },
-        .done = [](void *data, wp_color_manager_v1 *wp_color_manager_v4) {
-        },
-    };
+    using CreateDriverSurface = std::function<VkResult(xcb_window_t window, VkSurfaceKHR *surface)>;
 
-    static constexpr wl_registry_listener s_registryListener = {
-        .global = [](void *data, wl_registry * registry, uint32_t name, const char *interface, uint32_t version)
-        {
-            auto surface = reinterpret_cast<HdrSurfaceData *>(data);
+    static xcb_atom_t internX11Atom(xcb_connection_t *connection, std::string_view name, bool onlyIfExists)
+    {
+        xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(
+            connection, xcb_intern_atom(connection, onlyIfExists, name.size(), name.data()), nullptr);
+        xcb_atom_t atom = XCB_ATOM_NONE;
+        if (reply) {
+            atom = reply->atom;
+        }
+        free(reply);
+        return atom;
+    }
 
-            if (interface == "wp_color_manager_v1"sv) {
-                surface->colorManager = reinterpret_cast<wp_color_manager_v1 *>(wl_registry_bind(registry, name, &wp_color_manager_v1_interface, 1));
-                wp_color_manager_v1_add_listener(surface->colorManager, &s_colorManagerListener, surface);
-            }
-        },
-        .global_remove = [](void *data, wl_registry * registry, uint32_t name) {},
-    };
-};
+    static void createX11HdrSurface(VkInstance instance, VkSurfaceKHR surface, xcb_connection_t *connection, xcb_window_t window,
+                                    const CreateDriverSurface &createDriverSurface)
+    {
+        const xcb_atom_t hdrMetadataAtom = internX11Atom(connection, "hdr_output_metadata"sv, false);
+        if (hdrMetadataAtom == XCB_ATOM_NONE) {
+            fprintf(stderr, "[HDR Layer] failed to intern the hdr_output_metadata atom\n");
+            return;
+        }
 
-static constexpr wp_image_description_v1_listener s_imageDescriptionListener {
-    .failed = [](void *userData, wp_image_description_v1 *descr, uint32_t cause, const char *reason) {
-        fprintf(stderr, "[HDR Layer] creating image description failed! %s", reason);
-        *reinterpret_cast<bool *>(userData) = true;
-    },
-    .ready = [](void *userData, wp_image_description_v1 *descr, uint32_t id) {
-        *reinterpret_cast<bool *>(userData) = true;
-    },
+        HdrSurfaceData data{
+            .instance = instance,
+            .xcbConnection = connection,
+            .xcbWindow = window,
+            .hdrMetadataAtom = hdrMetadataAtom,
+            .hdrAtom = internX11Atom(connection, "HDR"sv, true),
+            .hdrCapableAtom = internX11Atom(connection, "HDR capable"sv, true),
+            .outputsDirty = true,
+        };
+
+        createX11HdrWindow(data, createDriverSurface);
+        if (data.hdrAtom && data.hdrCapableAtom) {
+            openX11RandrEventConnection(data);
+        } else {
+            fprintf(stderr, "[HDR Layer] X server doesn't have the HDR output properties\n");
+        }
+        HdrSurface::create(surface, std::move(data));
+
+        fprintf(stderr, "[HDR Layer] Created X11 HDR surface\n");
+    }
+
+    static void createX11HdrWindow(HdrSurfaceData &surface, const CreateDriverSurface &createDriverSurface)
+    {
+        xcb_connection_t *connection = surface.xcbConnection;
+        xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(connection, xcb_get_geometry(connection, surface.xcbWindow), nullptr);
+        if (!geometry) {
+            return;
+        }
+        const uint8_t depth = geometry->depth;
+        const xcb_window_t root = geometry->root;
+        surface.xcbRoot = root;
+        const uint16_t width = std::max<uint16_t>(geometry->width, 1);
+        const uint16_t height = std::max<uint16_t>(geometry->height, 1);
+        free(geometry);
+
+        if (depth == HDR_WINDOW_DEPTH) {
+            return;
+        }
+
+        const xcb_visualid_t visual = findHdrVisual(connection, root);
+        if (visual == XCB_NONE) {
+            fprintf(stderr, "[HDR Layer] X server doesn't support 10-bit windows\n");
+            return;
+        }
+
+        surface.hdrColormap = xcb_generate_id(connection);
+        surface.hdrWindow = xcb_generate_id(connection);
+        surface.hdrWindowWidth = width;
+        surface.hdrWindowHeight = height;
+
+        const uint32_t values[] = { XCB_BACK_PIXMAP_NONE, 0, surface.hdrColormap };
+        const bool created =
+            checkX11Request(connection, xcb_create_colormap_checked(connection, XCB_COLORMAP_ALLOC_NONE, surface.hdrColormap, root, visual)) &&
+            checkX11Request(connection, xcb_create_window_checked(connection, HDR_WINDOW_DEPTH, surface.hdrWindow, surface.xcbWindow,
+                                                                  0, 0, width, height, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, visual,
+                                                                  XCB_CW_BACK_PIXMAP | XCB_CW_BORDER_PIXEL | XCB_CW_COLORMAP, values)) &&
+            checkX11Request(connection, xcb_shape_rectangles_checked(connection, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_INPUT,
+                                                                     XCB_CLIP_ORDERING_UNSORTED, surface.hdrWindow, 0, 0, 0, nullptr));
+
+        if (!created || createDriverSurface(surface.hdrWindow, &surface.hdrWindowSurface) != VK_SUCCESS) {
+            fprintf(stderr, "[HDR Layer] Failed to create a 10-bit window\n");
+            destroyX11HdrWindow(surface);
+            surface.hdrWindow = XCB_NONE;
+            surface.hdrColormap = XCB_NONE;
+            surface.hdrWindowSurface = VK_NULL_HANDLE;
+        }
+    }
 };
 
 class VkDeviceOverrides
@@ -454,25 +679,37 @@ public:
         const VkAllocationCallbacks *pAllocator,
         VkSwapchainKHR *pSwapchain)
     {
+        VkSurfaceKHR oldDriverSurface = VK_NULL_HANDLE;
+        if (auto oldSwapchain = HdrSwapchain::get(pCreateInfo->oldSwapchain)) {
+            oldDriverSurface = oldSwapchain->driverSurface;
+        }
+
         auto hdrSurface = HdrSurface::get(pCreateInfo->surface);
         if (!hdrSurface)
             return pDispatch->CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
 
         VkSwapchainCreateInfoKHR swapchainInfo = *pCreateInfo;
 
-        if (hdrSurface) {
-            // If this is a custom surface, force the colorspace to something the driver won't touch
-            if (hdrSurface->supportsPassthrough) {
-                swapchainInfo.imageColorSpace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
-            } else {
-                swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-            }
-
-            fprintf(stderr, "[HDR Layer] Creating swapchain for id: %u - format: %s - colorspace: %s\n",
-                    wl_proxy_get_id(reinterpret_cast<struct wl_proxy *>(hdrSurface->surface)),
-                    vkroots::helpers::enumString(pCreateInfo->imageFormat),
-                    vkroots::helpers::enumString(pCreateInfo->imageColorSpace));
+        // If this is a custom surface, force the colorspace to something the driver won't touch
+        if (hdrSurface->supportsPassthrough) {
+            swapchainInfo.imageColorSpace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+        } else {
+            swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         }
+
+        const bool useHdrWindow = hdrSurface->hdrWindowSurface && isTenBitFormat(pCreateInfo->imageFormat);
+        if (useHdrWindow) {
+            swapchainInfo.surface = hdrSurface->hdrWindowSurface;
+        }
+        if (oldDriverSurface && oldDriverSurface != swapchainInfo.surface) {
+            swapchainInfo.oldSwapchain = VK_NULL_HANDLE;
+        }
+
+        fprintf(stderr, "[HDR Layer] Creating swapchain for window: %u - format: %s - colorspace: %s%s\n",
+                hdrSurface->xcbWindow,
+                vkroots::helpers::enumString(pCreateInfo->imageFormat),
+                vkroots::helpers::enumString(pCreateInfo->imageColorSpace),
+                useHdrWindow ? " - 10-bit window" : "");
 
         // Check for VkFormat support and return VK_ERROR_INITIALIZATION_FAILED
         // if that VkFormat is unsupported for the underlying surface.
@@ -489,8 +726,8 @@ public:
             }) != supportedSurfaceFormats.end();
 
             if (!supportedSwapchainFormat) {
-                fprintf(stderr, "[HDR Layer] Refusing to make swapchain (unsupported VkFormat) for id: %u - format: %s - colorspace: %s\n",
-                        wl_proxy_get_id(reinterpret_cast<struct wl_proxy *>(hdrSurface->surface)),
+                fprintf(stderr, "[HDR Layer] Refusing to make swapchain (unsupported VkFormat) for window: %u - format: %s - colorspace: %s\n",
+                        hdrSurface->xcbWindow,
                         vkroots::helpers::enumString(pCreateInfo->imageFormat),
                         vkroots::helpers::enumString(pCreateInfo->imageColorSpace));
 
@@ -498,32 +735,34 @@ public:
             }
         }
 
+        if (useHdrWindow) {
+            syncX11WindowGeometry(*hdrSurface.get());
+        }
+
         VkResult result = pDispatch->CreateSwapchainKHR(device, &swapchainInfo, pAllocator, pSwapchain);
-        if (result != VK_SUCCESS || !hdrSurface) {
+        if (result != VK_SUCCESS) {
             return result;
         }
-        const auto it = std::ranges::find_if(s_ExtraHDRSurfaceFormats, [&pCreateInfo](const ColorDescription &description) {
-            return description.surface.surfaceFormat.colorSpace == pCreateInfo->imageColorSpace;
-        });
-        if (it != s_ExtraHDRSurfaceFormats.end()) {
-            const auto &description = *it;
-            HdrSwapchain::create(*pSwapchain, HdrSwapchainData{
-                .surface = pCreateInfo->surface,
-                .primaries = description.primaries,
-                .transferFunction = description.transferFunction,
-                .desc_dirty = true,
-            });
-        } else {
-            if (pCreateInfo->imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-                && pCreateInfo->imageColorSpace != VK_COLOR_SPACE_PASS_THROUGH_EXT) {
-                fprintf(stderr, "[HDR Layer] Unknown colorspace %d, assuming untagged\n", pCreateInfo->imageColorSpace);
-            }
-            HdrSwapchain::create(*pSwapchain, HdrSwapchainData{
-                .surface = pCreateInfo->surface,
-                .untagged = true,
-                .desc_dirty = true,
-            });
+        if (hdrSurface->hdrWindow) {
+            setX11HdrWindowMapped(*hdrSurface.get(), useHdrWindow);
         }
+        const bool hdrAvailable = hdrSurface->hdrAvailable;
+        hdrSurface.clear();
+
+        const bool hdr10 = pCreateInfo->imageColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        if (!hdr10 && pCreateInfo->imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+            && pCreateInfo->imageColorSpace != VK_COLOR_SPACE_PASS_THROUGH_EXT) {
+            fprintf(stderr, "[HDR Layer] Unknown colorspace %d, assuming SDR\n", pCreateInfo->imageColorSpace);
+        }
+
+        HdrSwapchain::create(*pSwapchain, HdrSwapchainData{
+            .surface = pCreateInfo->surface,
+            .driverSurface = swapchainInfo.surface,
+            .usesHdrWindow = useHdrWindow,
+            .hdrAvailable = hdrAvailable,
+            .hdr10 = hdr10,
+            .metadataDirty = true,
+        });
         return VK_SUCCESS;
     }
 
@@ -555,20 +794,20 @@ public:
             fprintf(stderr, "[HDR Layer] VkHdrMetadataEXT: maxFrameAverageLightLevel %f nits\n", metadata.maxFrameAverageLightLevel);
 
             hdrSwapchain->metadata = metadata;
-            hdrSwapchain->desc_dirty = true;
+            hdrSwapchain->metadataDirty = true;
         }
     }
 
-    struct wayland_hdr_metadata {
+    struct hdr_luminance_metadata {
         uint32_t min_luminance;
         uint32_t max_luminance;
         uint32_t max_fall;
         uint32_t max_cll;
     };
-    static std::optional<wayland_hdr_metadata> validateHdrMetadata(const VkHdrMetadataEXT &metadata)
+    static std::optional<hdr_luminance_metadata> validateHdrMetadata(const VkHdrMetadataEXT &metadata)
     {
         constexpr int MIN_LUM_FACTOR = 10000;
-        wayland_hdr_metadata ret {
+        hdr_luminance_metadata ret {
             .min_luminance = (uint32_t)std::round(MIN_LUM_FACTOR * metadata.minLuminance),
             .max_luminance = (uint32_t)std::round(metadata.maxLuminance),
             .max_fall = (uint32_t)std::round(metadata.maxFrameAverageLightLevel),
@@ -596,76 +835,92 @@ public:
         return ret;
     }
 
+    static uint16_t toUint16(double value)
+    {
+        return std::clamp(std::round(value), 0.0, 65535.0);
+    }
+
+    static hdr_output_metadata toHdrOutputMetadata(const VkHdrMetadataEXT &metadata)
+    {
+        constexpr double primaryUnit = 50'000.0;
+        constexpr uint8_t HDMI_EOTF_SMPTE_ST2084 = 2;
+        constexpr uint8_t HDMI_STATIC_METADATA_TYPE1 = 0;
+
+        hdr_output_metadata ret;
+        memset(&ret, 0, sizeof(ret));
+        ret.metadata_type = HDMI_STATIC_METADATA_TYPE1;
+
+        hdr_metadata_infoframe &infoframe = ret.hdmi_metadata_type1;
+        infoframe.eotf = HDMI_EOTF_SMPTE_ST2084;
+        infoframe.metadata_type = HDMI_STATIC_METADATA_TYPE1;
+
+        const VkXYColorEXT primaries[] = {metadata.displayPrimaryRed, metadata.displayPrimaryGreen, metadata.displayPrimaryBlue};
+        for (size_t i = 0; i < std::size(primaries); i++) {
+            infoframe.display_primaries[i].x = toUint16(primaries[i].x * primaryUnit);
+            infoframe.display_primaries[i].y = toUint16(primaries[i].y * primaryUnit);
+        }
+        infoframe.white_point.x = toUint16(metadata.whitePoint.x * primaryUnit);
+        infoframe.white_point.y = toUint16(metadata.whitePoint.y * primaryUnit);
+
+        if (const auto luminance = validateHdrMetadata(metadata)) {
+            infoframe.max_display_mastering_luminance = toUint16(luminance->max_luminance);
+            infoframe.min_display_mastering_luminance = toUint16(luminance->min_luminance);
+            infoframe.max_cll = toUint16(luminance->max_cll);
+            infoframe.max_fall = toUint16(luminance->max_fall);
+        }
+        return ret;
+    }
+
+    static void updateX11HdrMetadata(const HdrSurfaceData &surface, const HdrSwapchainData &swapchain)
+    {
+        if (!swapchain.hdr10) {
+            setX11HdrMetadata(surface, nullptr);
+            return;
+        }
+
+        const hdr_output_metadata metadata = toHdrOutputMetadata(swapchain.metadata);
+        setX11HdrMetadata(surface, &metadata);
+    }
+
     static VkResult QueuePresentKHR(
         const vkroots::VkDeviceDispatch *pDispatch,
         VkQueue queue,
         const VkPresentInfoKHR *pPresentInfo)
     {
+        std::vector<uint32_t> suboptimalSwapchains;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-            if (auto hdrSwapchain = HdrSwapchain::get(pPresentInfo->pSwapchains[i])) {
-                if (hdrSwapchain->desc_dirty) {
-                    auto hdrSurface = HdrSurface::get(hdrSwapchain->surface);
-                    if (hdrSwapchain->untagged) {
-                        if (hdrSurface->colorSurface) {
-                            wp_color_management_surface_v1_destroy(hdrSurface->colorSurface);
-                            hdrSurface->colorSurface = nullptr;
-                        }
-                    } else {
-                        if (!hdrSurface->colorSurface) {
-                            hdrSurface->colorSurface = wp_color_manager_v1_get_surface(hdrSurface->colorManager, hdrSurface->surface);
-                        }
-                        constexpr double primaryUnit = 1'000'000.0;
-                        const auto creator = wp_color_manager_v1_create_parametric_creator(hdrSurface->colorManager);
-                        wp_image_description_creator_params_v1_set_primaries_named(creator, hdrSwapchain->primaries);
-                        wp_image_description_creator_params_v1_set_tf_named(creator, hdrSwapchain->transferFunction);
+            auto hdrSwapchain = HdrSwapchain::get(pPresentInfo->pSwapchains[i]);
+            if (!hdrSwapchain) {
+                continue;
+            }
 
-                        const auto &metadata = hdrSwapchain->metadata;
-                        const auto wlMetadata = validateHdrMetadata(metadata);
+            auto hdrSurface = HdrSurface::get(hdrSwapchain->surface);
+            if (!hdrSurface) {
+                continue;
+            }
 
-                        if (wlMetadata && wlMetadata->max_fall) {
-                            wp_image_description_creator_params_v1_set_max_fall(creator, wlMetadata->max_fall);
-                        }
-                        if (wlMetadata && wlMetadata->max_cll) {
-                            wp_image_description_creator_params_v1_set_max_cll(creator, wlMetadata->max_cll);
-                        }
-                        const bool hasMasteringPrimaries = std::ranges::find(hdrSurface->supportedFeatures, WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES) != hdrSurface->supportedFeatures.end();
-                        if (hasMasteringPrimaries) {
-                            if (wlMetadata && wlMetadata->max_luminance) {
-                                wp_image_description_creator_params_v1_set_mastering_luminance(creator, wlMetadata->min_luminance, wlMetadata->max_luminance);
-                            }
-                            wp_image_description_creator_params_v1_set_mastering_display_primaries(creator,
-                                                                                                    std::round(metadata.displayPrimaryRed.x * primaryUnit),
-                                                                                                    std::round(metadata.displayPrimaryRed.y * primaryUnit),
-                                                                                                    std::round(metadata.displayPrimaryGreen.x * primaryUnit),
-                                                                                                    std::round(metadata.displayPrimaryGreen.y * primaryUnit),
-                                                                                                    std::round(metadata.displayPrimaryBlue.x * primaryUnit),
-                                                                                                    std::round(metadata.displayPrimaryBlue.y * primaryUnit),
-                                                                                                    std::round(metadata.whitePoint.x * primaryUnit),
-                                                                                                    std::round(metadata.whitePoint.y * primaryUnit));
-                        }
-                        const bool hasCustomLuminance = std::ranges::find(hdrSurface->supportedFeatures, WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES) != hdrSurface->supportedFeatures.end();
-                        if (hasCustomLuminance && hdrSwapchain->transferFunction == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR) {
-                            // NOTE that this assumes that this is Windows-style scRGB
-                            wp_image_description_creator_params_v1_set_luminances(creator, 0, 80, 203);
-                        }
-                        const auto imageDescription = wp_image_description_creator_params_v1_create(creator);
+            pollX11WindowGeometry(*hdrSurface.get());
+            updateX11HdrAvailability(*hdrSurface.get());
+            if (hdrSurface->hdrAvailable != hdrSwapchain->hdrAvailable) {
+                suboptimalSwapchains.push_back(i);
+            }
 
-                        bool done = false;
-                        wp_image_description_v1_add_listener(imageDescription, &s_imageDescriptionListener, &done);
-                        wl_display_dispatch_queue(hdrSurface->display, hdrSurface->queue);
-                        // In theory the compositor could wait for a while here. In practice it doesn't.
-                        while (!done) {
-                            wl_display_roundtrip_queue(hdrSurface->display, hdrSurface->queue);
-                        }
-                        wp_color_management_surface_v1_set_image_description(hdrSurface->colorSurface, imageDescription, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
-                        wp_image_description_v1_destroy(imageDescription);
-                    }
-                    hdrSwapchain->desc_dirty = false;
-                }
+            if (hdrSwapchain->metadataDirty) {
+                updateX11HdrMetadata(*hdrSurface.get(), *hdrSwapchain.get());
+                hdrSwapchain->metadataDirty = false;
             }
         }
 
-        return pDispatch->QueuePresentKHR(queue, pPresentInfo);
+        VkResult result = pDispatch->QueuePresentKHR(queue, pPresentInfo);
+        for (const uint32_t i : suboptimalSwapchains) {
+            if (pPresentInfo->pResults && pPresentInfo->pResults[i] == VK_SUCCESS) {
+                pPresentInfo->pResults[i] = VK_SUBOPTIMAL_KHR;
+            }
+        }
+        if (!suboptimalSwapchains.empty() && result == VK_SUCCESS) {
+            result = VK_SUBOPTIMAL_KHR;
+        }
+        return result;
     }
 };
 }

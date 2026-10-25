@@ -1,54 +1,50 @@
-# Vulkan Wayland HDR WSI Layer
+# Vulkan X11 HDR WSI Layer
 
-NOTE: Mesa 25.1+ implements the color management protocol directly, this Vulkan layer is no longer necessary with that.
-
-Implements the following vulkan extensions, if either frog-color-management-v1 or xx-color-management-v4 Wayland protocol is supported by the compositor:
-- [VK_EXT_swapchain_colorspace](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_swapchain_colorspace.html)
+A Vulkan layer that adds HDR10 output to X11 applications. It implements:
+- [VK_EXT_swapchain_colorspace](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_swapchain_colorspace.html) with the `VK_COLOR_SPACE_HDR10_ST2084_EXT` colorspace
 - [VK_EXT_hdr_metadata](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_EXT_hdr_metadata.html)
 
-KWin supports the frog protocol since Plasma 6.0, and xx-color-management-v4 in 6.2.
+The layer only works with an X server that supports HDR through the protocol described below. A stock Xorg server doesn't, and the layer then doesn't expose any HDR formats.
 
-# How to Build from source
+# How it works
 
-0. Ensure you have Dependencies/Requirments
-- [Ninja build tool](https://github.com/ninja-build/ninja/wiki)
-- [Meson build system](https://mesonbuild.com/Getting-meson.html)
-- Vulkan development libraries (including headers)
-- Wayland development libraries
+- The HDR10 colorspace is offered while every monitor the window is on has the `HDR` and `HDR capable` RandR output properties set to 1.
+- When an application creates an HDR10 swapchain, the layer sets the `hdr_output_metadata` window property to a `struct hdr_output_metadata` (from `drm_mode.h`). It is built from the values passed to `vkSetHdrMetadataEXT`. The X server applies it to the monitor while the window covers that monitor fullscreen. The property is deleted when the swapchain is not HDR10.
+- Vulkan drivers only expose 10-bit formats for depth 30 windows. When the desktop runs at depth 24, the layer renders 10-bit swapchains into a depth 30 child window, which needs an X server that offers a 30-bit visual on depth 24 screens. 8-bit swapchains keep using the application's window.
+- When HDR is enabled or disabled on the window's monitors while the application runs, or the window moves to another monitor, presents return `VK_SUBOPTIMAL_KHR`. The application then recreates its swapchain with the formats that are now available.
 
-1. clone the repository and navigate into the directory:
+# Requirements
+
+- An X server with:
+  - the `HDR`, `HDR capable` and `SDR white level` RandR output properties
+  - support for the `hdr_output_metadata` window property
+  - a 30-bit visual on depth 24 screens
+- A Vulkan driver that supports 10-bit swapchains on X11, such as Mesa (RADV)
+- A monitor that supports HDR10
+
+# Building
+
+Dependencies:
+- [Meson](https://mesonbuild.com/Getting-meson.html) and [Ninja](https://github.com/ninja-build/ninja/wiki)
+- Vulkan headers and loader
+- libxcb (including xcb-randr and xcb-shape) and libX11-xcb
 
 ```bash
-git clone https://github.com/Zamundaaa/VK_hdr_layer.git
-cd VK_hdr_layer
-```
-2. Use Mason/ninja to build and install the layer:
-
-```bash
-meson setup builddir
-ninja -C builddir
-sudo meson install -C builddir
+meson setup build
+ninja -C build
+sudo meson install -C build
 ```
 
-This will install the layer files into the appropriate system directories.
+# Usage
 
-3. Enable HDR in your compositor 
-[Arch - HDR monitor Support](https://wiki.archlinux.org/title/HDR_monitor_support) has links with instructions for different compositors
+1. Enable HDR on the monitor:
+   ```bash
+   xrandr --output DP-1 --set HDR 1
+   ```
+   Run `xrandr --prop` to check that the monitor reports `HDR capable: 1`. The `SDR white level` property sets how bright the SDR desktop is shown in HDR mode, in nits.
+2. Start the application with `ENABLE_HDR_WSI=1`.
+3. Run the application fullscreen. The X server treats a window that doesn't cover the monitor as SDR content, so HDR content in it looks washed out.
 
-# Testing with Quake II RTX
+For Proton/Wine games, set the launch options to `ENABLE_HDR_WSI=1 DXVK_HDR=1 %command%` and enable HDR in the game's settings.
 
-Quake II RTX suports HDR when run in Wayland native mode with this Vulkan layer. To do that, put `SDL_VIDEODRIVER=wayland ENABLE_HDR_WSI=1 %command%` into its launch arguments.
-
-# Testing with Wine Wayland
-
-As of [Wine 9.0](https://gitlab.winehq.org/wine/wine/-/releases/wine-9.0), Wine's native wayland mode supports HDR through DXVK.    
-To enable it, run `wine reg.exe add HKCU\\Software\\Wine\\Drivers /v Graphics /d x11,wayland` inside your Wine Prefix, Then unset the `DISPLAY` variable and set `DXVK_HDR=1`
-Make sure you set `ENABLE_HDR_WSI=1` when running an application or game.
-
-# Testing with Video Players
-
-[mpv](https://mpv.io/) Supports HDR Video playback through Vulkan's HDR Surface.    
-To play an HDR video, set `ENABLE_HDR_WSI=1` and run mpv with `--vo=gpu-next --target-colorspace-hint --gpu-api=vulkan --gpu-context=waylandvk`
-
-# Gamescope
-Gamescope implements color management protocols directly and this layer should *not* be used with it.
+Don't use the layer with applications that set the `hdr_output_metadata` property themselves, such as an mpv build with X11 HDR support.

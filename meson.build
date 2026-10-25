@@ -1,6 +1,5 @@
 project(
   'vk_hdr_layer',
-  'c',
   'cpp',
   meson_version: '>=0.58.0',
   default_options: [
@@ -37,5 +36,4 @@ if not cppc.check_header('vulkan/vulkan.h', dependencies: vulkan_dep)
   error('Missing vulkan-headers')
 endif
 
-subdir('protocols')
 subdir('src')
