@@ -276,16 +276,21 @@ static void updateX11HdrAvailability(HdrSurfaceData &surface)
     }
 
     bool onOutput = false;
-    surface.hdrAvailable = true;
+    bool hdrAvailable = true;
     for (const X11Output &output : surface.outputs) {
         const bool overlaps = surface.windowX < output.x + output.width && output.x < surface.windowX + surface.windowWidth
             && surface.windowY < output.y + output.height && output.y < surface.windowY + surface.windowHeight;
         if (overlaps) {
             onOutput = true;
-            surface.hdrAvailable &= output.hdr;
+            hdrAvailable &= output.hdr;
         }
     }
-    surface.hdrAvailable &= onOutput;
+
+    /* Window managers hide windows by moving them outside of the screen (such as when switching workspace),
+       which shouldn't make the application recreate its swapchain without hdr */
+    if (onOutput) {
+        surface.hdrAvailable = hdrAvailable;
+    }
 }
 
 static void destroyX11HdrWindow(const HdrSurfaceData &surface)
