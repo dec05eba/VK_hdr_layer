@@ -804,14 +804,21 @@ public:
         uint32_t max_fall;
         uint32_t max_cll;
     };
+    /* Some games set luminance values above the maximum that pq can represent */
+    static uint32_t clampLuminance(float nits, double unit)
+    {
+        constexpr double PQ_MAX_LUMINANCE = 10000.0;
+        return std::round(std::fmin(std::fmax(nits, 0.0), PQ_MAX_LUMINANCE) * unit);
+    }
+
     static std::optional<hdr_luminance_metadata> validateHdrMetadata(const VkHdrMetadataEXT &metadata)
     {
         constexpr int MIN_LUM_FACTOR = 10000;
         hdr_luminance_metadata ret {
-            .min_luminance = (uint32_t)std::round(MIN_LUM_FACTOR * metadata.minLuminance),
-            .max_luminance = (uint32_t)std::round(metadata.maxLuminance),
-            .max_fall = (uint32_t)std::round(metadata.maxFrameAverageLightLevel),
-            .max_cll = (uint32_t)std::round(metadata.maxContentLightLevel),
+            .min_luminance = clampLuminance(metadata.minLuminance, MIN_LUM_FACTOR),
+            .max_luminance = clampLuminance(metadata.maxLuminance, 1.0),
+            .max_fall = clampLuminance(metadata.maxFrameAverageLightLevel, 1.0),
+            .max_cll = clampLuminance(metadata.maxContentLightLevel, 1.0),
         };
         if (ret.max_cll != 0) {
             const bool invalid = ret.max_cll * MIN_LUM_FACTOR < ret.min_luminance
