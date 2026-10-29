@@ -9,7 +9,7 @@ The layer only works with an X server that supports HDR through the protocol des
 # How it works
 
 - The HDR10 colorspace is offered while every monitor the window is on has the `HDR` and `HDR capable` RandR output properties set to 1.
-- When an application creates an HDR10 swapchain, the layer sets the `hdr_output_metadata` window property to a `struct hdr_output_metadata` (from `drm_mode.h`). It is built from the values passed to `vkSetHdrMetadataEXT`. The X server applies it to the monitor while the window covers that monitor fullscreen. The property is deleted when the swapchain is not HDR10.
+- When an application creates an HDR10 swapchain, the layer sets the `hdr_output_metadata` window property to a `struct hdr_output_metadata` (from `drm_mode.h`). It is built from the values passed to `vkSetHdrMetadataEXT`. The X server shows the window as HDR on monitors with HDR enabled, fullscreen or windowed. The property is deleted when the swapchain is not HDR10.
 - Vulkan drivers only expose 10-bit formats for depth 30 windows. When the desktop runs at depth 24, the layer renders 10-bit swapchains into a depth 30 child window, which needs an X server that offers a 30-bit visual on depth 24 screens. 8-bit swapchains keep using the application's window.
 - When HDR is enabled or disabled on the window's monitors while the application runs, or the window moves to another monitor, presents return `VK_SUBOPTIMAL_KHR`. The application then recreates its swapchain with the formats that are now available.
 
@@ -46,7 +46,7 @@ sudo meson install -C build
    ```bash
    ENABLE_HDR_WSI=1 vkcube
    ```
-3. Run the application fullscreen. The X server treats a window that doesn't cover the monitor as SDR content, so HDR content in it looks washed out.
+3. The application can run fullscreen or in a window. HDR in a window needs an X server that composites HDR windows, such as [this Xorg fork](https://github.com/dec05eba/xserver) with per-monitor framebuffers enabled (the default). Other X servers only show HDR for fullscreen windows, and HDR content in a window looks washed out.
 
 The layer prints messages prefixed with `[HDR Layer]` to stderr. `Enabling format: ... colorspace: 1000104008` means that HDR10 is offered to the application.
 
