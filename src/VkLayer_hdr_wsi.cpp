@@ -1,6 +1,5 @@
-#define VK_USE_PLATFORM_XCB_KHR
-#define VK_USE_PLATFORM_XLIB_KHR
 #include "vkroots.h"
+#include "FormatConversion.h"
 
 #include <X11/Xlib-xcb.h>
 #include <xcb/randr.h>
@@ -73,6 +72,33 @@ static constexpr uint8_t HDR_WINDOW_DEPTH = 30;
 static bool isTenBitFormat(VkFormat format)
 {
     return format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+}
+
+template <typename Func, typename InArray, typename OutType, typename... Args>
+static VkResult append(Func function, const InArray &inArray, uint32_t *pOutCount, OutType *pOut, Args... arguments)
+{
+    uint32_t baseCount = 0;
+    VkResult result = function(arguments..., &baseCount, nullptr);
+    if (result < 0) {
+        return result;
+    }
+
+    const uint32_t totalCount = baseCount + uint32_t(inArray.size());
+    if (!pOut) {
+        *pOutCount = totalCount;
+        return VK_SUCCESS;
+    }
+
+    uint32_t count = std::min(*pOutCount, baseCount);
+    result = function(arguments..., &count, pOut);
+    if (result < 0) {
+        return result;
+    }
+
+    const uint32_t extraCount = std::min(*pOutCount - count, uint32_t(inArray.size()));
+    std::copy_n(inArray.begin(), extraCount, pOut + count);
+    *pOutCount = count + extraCount;
+    return *pOutCount < totalCount ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 static void discardX11Errors(xcb_connection_t *connection, xcb_void_cookie_t cookie)
@@ -406,6 +432,7 @@ static VkResult getHdrSurfaceExtraFormats(const vkroots::VkInstanceDispatch *pDi
 struct HdrSwapchainData {
     VkSurfaceKHR surface;
     VkSurfaceKHR driverSurface;
+    std::unique_ptr<FormatConversion> formatConversion;
     bool usesHdrWindow = false;
     bool hdrAvailable = false;
     bool hdr10 = false;
@@ -415,9 +442,45 @@ struct HdrSwapchainData {
 };
 VKROOTS_DEFINE_SYNCHRONIZED_MAP_TYPE(HdrSwapchain, VkSwapchainKHR);
 
+struct HdrDeviceData {
+    PFN_vkSetDeviceLoaderData setDeviceLoaderData;
+};
+VKROOTS_DEFINE_SYNCHRONIZED_MAP_TYPE(HdrDevice, VkDevice);
+
+static PFN_vkSetDeviceLoaderData findSetDeviceLoaderData(const VkDeviceCreateInfo *pCreateInfo)
+{
+    for (auto *node = static_cast<const VkBaseInStructure *>(pCreateInfo->pNext); node; node = node->pNext) {
+        const auto *layerInfo = reinterpret_cast<const VkLayerDeviceCreateInfo *>(node);
+        if (node->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO && layerInfo->function == VK_LOADER_DATA_CALLBACK) {
+            return layerInfo->u.pfnSetDeviceLoaderData;
+        }
+    }
+    return nullptr;
+}
+
+static PFN_vkSetDeviceLoaderData getSetDeviceLoaderData(VkDevice device)
+{
+    auto hdrDevice = HdrDevice::get(device);
+    return hdrDevice ? hdrDevice->setDeviceLoaderData : nullptr;
+}
+
 class VkInstanceOverrides
 {
 public:
+    static VkResult CreateDevice(
+        const vkroots::VkInstanceDispatch *pDispatch,
+        VkPhysicalDevice physicalDevice,
+        const VkDeviceCreateInfo *pCreateInfo,
+        const VkAllocationCallbacks *pAllocator,
+        VkDevice *pDevice)
+    {
+        const VkResult result = pDispatch->CreateDevice(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        if (result == VK_SUCCESS) {
+            HdrDevice::create(*pDevice, HdrDeviceData{ .setDeviceLoaderData = findSetDeviceLoaderData(pCreateInfo) });
+        }
+        return result;
+    }
+
     static VkResult CreateXcbSurfaceKHR(
         const vkroots::VkInstanceDispatch *pDispatch,
         VkInstance instance,
@@ -477,7 +540,7 @@ public:
             return result;
         }
 
-        return vkroots::helpers::append(
+        return append(
                    pDispatch->GetPhysicalDeviceSurfaceFormatsKHR,
                    extraFormats,
                    pSurfaceFormatCount,
@@ -513,7 +576,7 @@ public:
             });
         }
 
-        return vkroots::helpers::append(
+        return append(
                    pDispatch->GetPhysicalDeviceSurfaceFormats2KHR,
                    extraFormats,
                    pSurfaceFormatCount,
@@ -562,7 +625,7 @@ public:
             }
         }
 
-        return vkroots::helpers::append(
+        return append(
                    pDispatch->EnumerateDeviceExtensionProperties,
                    s_LayerExposedExts,
                    pPropertyCount,
@@ -667,12 +730,37 @@ private:
 class VkDeviceOverrides
 {
 public:
+    static void DestroyDevice(
+        const vkroots::VkDeviceDispatch *pDispatch,
+        VkDevice device,
+        const VkAllocationCallbacks *pAllocator)
+    {
+        HdrDevice::remove(device);
+        pDispatch->DestroyDevice(device, pAllocator);
+    }
+
+    static VkResult GetSwapchainImagesKHR(
+        const vkroots::VkDeviceDispatch *pDispatch,
+        VkDevice device,
+        VkSwapchainKHR swapchain,
+        uint32_t *pSwapchainImageCount,
+        VkImage *pSwapchainImages)
+    {
+        if (auto hdrSwapchain = HdrSwapchain::get(swapchain); hdrSwapchain && hdrSwapchain->formatConversion) {
+            return hdrSwapchain->formatConversion->getImages(pSwapchainImageCount, pSwapchainImages);
+        }
+        return pDispatch->GetSwapchainImagesKHR(device, swapchain, pSwapchainImageCount, pSwapchainImages);
+    }
+
     static void DestroySwapchainKHR(
         const vkroots::VkDeviceDispatch *pDispatch,
         VkDevice device,
         VkSwapchainKHR swapchain,
         const VkAllocationCallbacks *pAllocator)
     {
+        if (auto hdrSwapchain = HdrSwapchain::get(swapchain); hdrSwapchain && hdrSwapchain->formatConversion) {
+            hdrSwapchain->formatConversion->destroy();
+        }
         HdrSwapchain::remove(swapchain);
         pDispatch->DestroySwapchainKHR(device, swapchain, pAllocator);
     }
@@ -716,28 +804,36 @@ public:
                 vkroots::helpers::enumString(pCreateInfo->imageColorSpace),
                 useHdrWindow ? " - 10-bit window" : "");
 
-        // Check for VkFormat support and return VK_ERROR_INITIALIZATION_FAILED
-        // if that VkFormat is unsupported for the underlying surface.
-        {
-            std::vector<VkSurfaceFormatKHR> supportedSurfaceFormats;
-            vkroots::helpers::enumerate(
-                pDispatch->pPhysicalDeviceDispatch->pInstanceDispatch->GetPhysicalDeviceSurfaceFormatsKHR,
-                supportedSurfaceFormats,
-                pDispatch->PhysicalDevice,
-                swapchainInfo.surface);
+        std::vector<VkSurfaceFormatKHR> supportedSurfaceFormats;
+        vkroots::helpers::enumerate(
+            pDispatch->pPhysicalDeviceDispatch->pInstanceDispatch->GetPhysicalDeviceSurfaceFormatsKHR,
+            supportedSurfaceFormats,
+            pDispatch->PhysicalDevice,
+            swapchainInfo.surface);
+        const auto supportsFormat = [&supportedSurfaceFormats](VkFormat format) {
+            return std::ranges::any_of(supportedSurfaceFormats, [format](VkSurfaceFormatKHR value) {
+                return value.format == format;
+            });
+        };
 
-            bool supportedSwapchainFormat = std::ranges::find_if(supportedSurfaceFormats, [=](VkSurfaceFormatKHR value) {
-                return value.format == swapchainInfo.imageFormat;
-            }) != supportedSurfaceFormats.end();
+        const VkFormat presentableFormat = FormatConversion::getPresentableFormat(pCreateInfo->imageFormat);
+        const bool formatSupported = supportsFormat(pCreateInfo->imageFormat);
+        const bool convertFormat = !formatSupported && supportsFormat(presentableFormat) && FormatConversion::canConvert(pDispatch, *pCreateInfo);
+        if (!formatSupported && !convertFormat) {
+            fprintf(stderr, "[HDR Layer] Refusing to make swapchain (unsupported VkFormat) for window: %u - format: %s - colorspace: %s\n",
+                    hdrSurface->xcbWindow,
+                    vkroots::helpers::enumString(pCreateInfo->imageFormat),
+                    vkroots::helpers::enumString(pCreateInfo->imageColorSpace));
 
-            if (!supportedSwapchainFormat) {
-                fprintf(stderr, "[HDR Layer] Refusing to make swapchain (unsupported VkFormat) for window: %u - format: %s - colorspace: %s\n",
-                        hdrSurface->xcbWindow,
-                        vkroots::helpers::enumString(pCreateInfo->imageFormat),
-                        vkroots::helpers::enumString(pCreateInfo->imageColorSpace));
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
 
-                return VK_ERROR_INITIALIZATION_FAILED;
-            }
+        if (convertFormat) {
+            fprintf(stderr, "[HDR Layer] Presenting %s as %s\n",
+                    vkroots::helpers::enumString(pCreateInfo->imageFormat),
+                    vkroots::helpers::enumString(presentableFormat));
+            swapchainInfo.imageFormat = presentableFormat;
+            swapchainInfo.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         }
 
         if (useHdrWindow) {
@@ -748,6 +844,16 @@ public:
         if (result != VK_SUCCESS) {
             return result;
         }
+
+        std::unique_ptr<FormatConversion> formatConversion;
+        if (convertFormat) {
+            result = FormatConversion::create(pDispatch, getSetDeviceLoaderData(device), *pCreateInfo, *pSwapchain, formatConversion);
+            if (result != VK_SUCCESS) {
+                pDispatch->DestroySwapchainKHR(device, *pSwapchain, pAllocator);
+                return result;
+            }
+        }
+
         if (hdrSurface->hdrWindow) {
             setX11HdrWindowMapped(*hdrSurface.get(), useHdrWindow);
         }
@@ -763,6 +869,7 @@ public:
         HdrSwapchain::create(*pSwapchain, HdrSwapchainData{
             .surface = pCreateInfo->surface,
             .driverSurface = swapchainInfo.surface,
+            .formatConversion = std::move(formatConversion),
             .usesHdrWindow = useHdrWindow,
             .hdrAvailable = hdrAvailable,
             .hdr10 = hdr10,
@@ -899,11 +1006,23 @@ public:
         VkQueue queue,
         const VkPresentInfoKHR *pPresentInfo)
     {
+        std::vector<VkSemaphore> blitSemaphores;
         std::vector<uint32_t> suboptimalSwapchains;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
             auto hdrSwapchain = HdrSwapchain::get(pPresentInfo->pSwapchains[i]);
             if (!hdrSwapchain) {
                 continue;
+            }
+
+            if (hdrSwapchain->formatConversion) {
+                const uint32_t waitSemaphoreCount = blitSemaphores.empty() ? pPresentInfo->waitSemaphoreCount : 0;
+                VkSemaphore blitDone;
+                const VkResult result = hdrSwapchain->formatConversion->blit(queue, pPresentInfo->pImageIndices[i], waitSemaphoreCount,
+                                                                             pPresentInfo->pWaitSemaphores, &blitDone);
+                if (result != VK_SUCCESS) {
+                    return result;
+                }
+                blitSemaphores.push_back(blitDone);
             }
 
             auto hdrSurface = HdrSurface::get(hdrSwapchain->surface);
@@ -923,7 +1042,13 @@ public:
             }
         }
 
-        VkResult result = pDispatch->QueuePresentKHR(queue, pPresentInfo);
+        VkPresentInfoKHR presentInfo = *pPresentInfo;
+        if (!blitSemaphores.empty()) {
+            presentInfo.waitSemaphoreCount = uint32_t(blitSemaphores.size());
+            presentInfo.pWaitSemaphores = blitSemaphores.data();
+        }
+
+        VkResult result = pDispatch->QueuePresentKHR(queue, &presentInfo);
         for (const uint32_t i : suboptimalSwapchains) {
             if (pPresentInfo->pResults && pPresentInfo->pResults[i] == VK_SUCCESS) {
                 pPresentInfo->pResults[i] = VK_SUBOPTIMAL_KHR;
@@ -943,3 +1068,4 @@ VKROOTS_DEFINE_LAYER_INTERFACES(HdrLayer::VkInstanceOverrides,
 
 VKROOTS_IMPLEMENT_SYNCHRONIZED_MAP_TYPE(HdrLayer::HdrSurface);
 VKROOTS_IMPLEMENT_SYNCHRONIZED_MAP_TYPE(HdrLayer::HdrSwapchain);
+VKROOTS_IMPLEMENT_SYNCHRONIZED_MAP_TYPE(HdrLayer::HdrDevice);

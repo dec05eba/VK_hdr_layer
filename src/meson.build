@@ -4,7 +4,8 @@ x11_xcb_dep = dependency('x11-xcb')
 xcb_shape_dep = dependency('xcb-shape')
 xcb_randr_dep = dependency('xcb-randr')
 
-hdr_wsi_layer = shared_library('VkLayer_hdr_wsi', 'VkLayer_hdr_wsi.cpp',
+hdr_wsi_layer = shared_library('VkLayer_hdr_wsi', 'VkLayer_hdr_wsi.cpp', 'FormatConversion.cpp',
+  cpp_args         : [ '-DVK_USE_PLATFORM_XCB_KHR', '-DVK_USE_PLATFORM_XLIB_KHR' ],
   dependencies     : [ vkroots_dep, xcb_dep, x11_xcb_dep, xcb_shape_dep, xcb_randr_dep ],
   install          : true )
 
