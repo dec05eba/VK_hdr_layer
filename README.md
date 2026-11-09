@@ -30,9 +30,10 @@ Dependencies:
 - libxcb (including xcb-randr and xcb-shape) and libX11-xcb
 
 ```bash
+git submodule update --init
 meson setup build
 ninja -C build
-sudo meson install -C build
+sudo meson install -C build --skip-subprojects vkroots
 ```
 
 # Usage

@@ -14,8 +14,8 @@ class FormatConversion
 {
 public:
     static VkFormat getPresentableFormat(VkFormat format);
-    static bool canConvert(const vkroots::VkDeviceDispatch *pDispatch, const VkSwapchainCreateInfoKHR &createInfo);
-    static VkResult create(const vkroots::VkDeviceDispatch *pDispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
+    static bool canConvert(const vkroots::VkDeviceDispatch &dispatch, const VkSwapchainCreateInfoKHR &createInfo);
+    static VkResult create(const vkroots::VkDeviceDispatch &dispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
                            const VkSwapchainCreateInfoKHR &createInfo, VkSwapchainKHR swapchain, std::unique_ptr<FormatConversion> &conversion);
     void destroy();
 
@@ -32,7 +32,7 @@ private:
         VkFence blitFence = VK_NULL_HANDLE;
     };
 
-    FormatConversion(const vkroots::VkDeviceDispatch *pDispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData, const VkSwapchainCreateInfoKHR &createInfo);
+    FormatConversion(const vkroots::VkDeviceDispatch &dispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData, const VkSwapchainCreateInfoKHR &createInfo);
 
     VkResult createImage(const VkSwapchainCreateInfoKHR &createInfo, VkImage swapchainImage);
     VkResult useQueue(VkQueue queue);
@@ -41,7 +41,7 @@ private:
     VkResult waitForBlits() const;
     VkResult recordBlit(const Image &image) const;
 
-    const vkroots::VkDeviceDispatch *m_pDispatch;
+    const vkroots::VkDeviceDispatch &m_dispatch;
     PFN_vkSetDeviceLoaderData m_setDeviceLoaderData;
     VkExtent2D m_extent;
     uint32_t m_layers;

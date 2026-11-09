@@ -6,20 +6,10 @@
 namespace HdrLayer
 {
 
-static bool hasStruct(const void *pNext, VkStructureType type)
-{
-    for (auto *node = static_cast<const VkBaseInStructure *>(pNext); node; node = node->pNext) {
-        if (node->sType == type) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static std::optional<uint32_t> findMemoryType(const vkroots::VkDeviceDispatch *pDispatch, uint32_t typeBits)
+static std::optional<uint32_t> findMemoryType(const vkroots::VkDeviceDispatch &dispatch, uint32_t typeBits)
 {
     VkPhysicalDeviceMemoryProperties properties;
-    pDispatch->pPhysicalDeviceDispatch->pInstanceDispatch->GetPhysicalDeviceMemoryProperties(pDispatch->PhysicalDevice, &properties);
+    dispatch.GetPhysicalDeviceMemoryProperties(dispatch.PhysicalDevice, &properties);
 
     std::optional<uint32_t> memoryType;
     for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
@@ -36,9 +26,9 @@ static std::optional<uint32_t> findMemoryType(const vkroots::VkDeviceDispatch *p
     return memoryType;
 }
 
-static std::optional<uint32_t> findQueueFamily(const vkroots::VkDeviceDispatch *pDispatch, VkQueue queue)
+static std::optional<uint32_t> findQueueFamily(const vkroots::VkDeviceDispatch &dispatch, VkQueue queue)
 {
-    for (const VkDeviceQueueCreateInfo &queueInfo : pDispatch->DeviceQueueInfos) {
+    for (const VkDeviceQueueCreateInfo &queueInfo : dispatch.DeviceQueueInfos) {
         for (uint32_t i = 0; i < queueInfo.queueCount; i++) {
             VkQueue deviceQueue = VK_NULL_HANDLE;
             if (queueInfo.flags) {
@@ -48,9 +38,9 @@ static std::optional<uint32_t> findQueueFamily(const vkroots::VkDeviceDispatch *
                     .queueFamilyIndex = queueInfo.queueFamilyIndex,
                     .queueIndex = i,
                 };
-                pDispatch->GetDeviceQueue2(pDispatch->Device, &info, &deviceQueue);
+                dispatch.GetDeviceQueue2(dispatch.Device, &info, &deviceQueue);
             } else {
-                pDispatch->GetDeviceQueue(pDispatch->Device, queueInfo.queueFamilyIndex, i, &deviceQueue);
+                dispatch.GetDeviceQueue(dispatch.Device, queueInfo.queueFamilyIndex, i, &deviceQueue);
             }
 
             if (deviceQueue == queue) {
@@ -61,13 +51,12 @@ static std::optional<uint32_t> findQueueFamily(const vkroots::VkDeviceDispatch *
     return std::nullopt;
 }
 
-static bool supportsGraphics(const vkroots::VkDeviceDispatch *pDispatch, uint32_t queueFamily)
+static bool supportsGraphics(const vkroots::VkDeviceDispatch &dispatch, uint32_t queueFamily)
 {
-    const vkroots::VkInstanceDispatch *pInstanceDispatch = pDispatch->pPhysicalDeviceDispatch->pInstanceDispatch;
     uint32_t count = 0;
-    pInstanceDispatch->GetPhysicalDeviceQueueFamilyProperties(pDispatch->PhysicalDevice, &count, nullptr);
+    dispatch.GetPhysicalDeviceQueueFamilyProperties(dispatch.PhysicalDevice, &count, nullptr);
     std::vector<VkQueueFamilyProperties> families(count);
-    pInstanceDispatch->GetPhysicalDeviceQueueFamilyProperties(pDispatch->PhysicalDevice, &count, families.data());
+    dispatch.GetPhysicalDeviceQueueFamilyProperties(dispatch.PhysicalDevice, &count, families.data());
     return queueFamily < count && (families[queueFamily].queueFlags & VK_QUEUE_GRAPHICS_BIT);
 }
 
@@ -92,7 +81,7 @@ VkFormat FormatConversion::getPresentableFormat(VkFormat format)
     return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? VK_FORMAT_A2R10G10B10_UNORM_PACK32 : format;
 }
 
-bool FormatConversion::canConvert(const vkroots::VkDeviceDispatch *pDispatch, const VkSwapchainCreateInfoKHR &createInfo)
+bool FormatConversion::canConvert(const vkroots::VkDeviceDispatch &dispatch, const VkSwapchainCreateInfoKHR &createInfo)
 {
     const VkFormat presentableFormat = getPresentableFormat(createInfo.imageFormat);
     if (presentableFormat == createInfo.imageFormat) {
@@ -101,19 +90,18 @@ bool FormatConversion::canConvert(const vkroots::VkDeviceDispatch *pDispatch, co
 
     constexpr VkSwapchainCreateFlagsKHR unsupportedFlags = VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR | VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR
         | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
-    if ((createInfo.flags & unsupportedFlags) || hasStruct(createInfo.pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)) {
+    if ((createInfo.flags & unsupportedFlags) || vkroots::FindInChain<VkImageFormatListCreateInfo>(&createInfo)) {
         return false;
     }
 
-    const vkroots::VkInstanceDispatch *pInstanceDispatch = pDispatch->pPhysicalDeviceDispatch->pInstanceDispatch;
     VkFormatProperties source;
     VkFormatProperties destination;
-    pInstanceDispatch->GetPhysicalDeviceFormatProperties(pDispatch->PhysicalDevice, createInfo.imageFormat, &source);
-    pInstanceDispatch->GetPhysicalDeviceFormatProperties(pDispatch->PhysicalDevice, presentableFormat, &destination);
+    dispatch.GetPhysicalDeviceFormatProperties(dispatch.PhysicalDevice, createInfo.imageFormat, &source);
+    dispatch.GetPhysicalDeviceFormatProperties(dispatch.PhysicalDevice, presentableFormat, &destination);
     return (source.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (destination.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
 }
 
-VkResult FormatConversion::create(const vkroots::VkDeviceDispatch *pDispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
+VkResult FormatConversion::create(const vkroots::VkDeviceDispatch &dispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
                                   const VkSwapchainCreateInfoKHR &createInfo, VkSwapchainKHR swapchain, std::unique_ptr<FormatConversion> &conversion)
 {
     if (!setDeviceLoaderData) {
@@ -121,17 +109,17 @@ VkResult FormatConversion::create(const vkroots::VkDeviceDispatch *pDispatch, PF
     }
 
     uint32_t count = 0;
-    VkResult result = pDispatch->GetSwapchainImagesKHR(pDispatch->Device, swapchain, &count, nullptr);
+    VkResult result = dispatch.GetSwapchainImagesKHR(dispatch.Device, swapchain, &count, nullptr);
     if (result != VK_SUCCESS) {
         return result;
     }
     std::vector<VkImage> swapchainImages(count);
-    result = pDispatch->GetSwapchainImagesKHR(pDispatch->Device, swapchain, &count, swapchainImages.data());
+    result = dispatch.GetSwapchainImagesKHR(dispatch.Device, swapchain, &count, swapchainImages.data());
     if (result != VK_SUCCESS) {
         return result;
     }
 
-    std::unique_ptr<FormatConversion> newConversion{ new FormatConversion(pDispatch, setDeviceLoaderData, createInfo) };
+    std::unique_ptr<FormatConversion> newConversion{ new FormatConversion(dispatch, setDeviceLoaderData, createInfo) };
     for (VkImage swapchainImage : swapchainImages) {
         result = newConversion->createImage(createInfo, swapchainImage);
         if (result != VK_SUCCESS) {
@@ -144,9 +132,9 @@ VkResult FormatConversion::create(const vkroots::VkDeviceDispatch *pDispatch, PF
     return VK_SUCCESS;
 }
 
-FormatConversion::FormatConversion(const vkroots::VkDeviceDispatch *pDispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
+FormatConversion::FormatConversion(const vkroots::VkDeviceDispatch &dispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
                                    const VkSwapchainCreateInfoKHR &createInfo)
-    : m_pDispatch(pDispatch)
+    : m_dispatch(dispatch)
     , m_setDeviceLoaderData(setDeviceLoaderData)
     , m_extent(createInfo.imageExtent)
     , m_layers(createInfo.imageArrayLayers)
@@ -158,19 +146,19 @@ void FormatConversion::destroy()
     waitForBlits();
     destroyCommandBuffers();
 
-    const VkDevice device = m_pDispatch->Device;
+    const VkDevice device = m_dispatch.Device;
     for (const Image &image : m_images) {
-        m_pDispatch->DestroyFence(device, image.blitFence, nullptr);
-        m_pDispatch->DestroySemaphore(device, image.blitDone, nullptr);
-        m_pDispatch->DestroyImage(device, image.image, nullptr);
-        m_pDispatch->FreeMemory(device, image.memory, nullptr);
+        m_dispatch.DestroyFence(device, image.blitFence, nullptr);
+        m_dispatch.DestroySemaphore(device, image.blitDone, nullptr);
+        m_dispatch.DestroyImage(device, image.image, nullptr);
+        m_dispatch.FreeMemory(device, image.memory, nullptr);
     }
     m_images.clear();
 }
 
 VkResult FormatConversion::getImages(uint32_t *pCount, VkImage *pImages) const
 {
-    return vkroots::helpers::array(m_images, pCount, pImages, [](VkImage &out, const Image &image) { out = image.image; });
+    return vkroots::array(m_images, pCount, pImages, [](VkImage &out, const Image &image) { out = image.image; });
 }
 
 VkResult FormatConversion::blit(VkQueue queue, uint32_t imageIndex, uint32_t waitSemaphoreCount, const VkSemaphore *pWaitSemaphores,
@@ -182,8 +170,8 @@ VkResult FormatConversion::blit(VkQueue queue, uint32_t imageIndex, uint32_t wai
     }
 
     const Image &image = m_images[imageIndex];
-    const VkDevice device = m_pDispatch->Device;
-    result = m_pDispatch->WaitForFences(device, 1, &image.blitFence, VK_TRUE, UINT64_MAX);
+    const VkDevice device = m_dispatch.Device;
+    result = m_dispatch.WaitForFences(device, 1, &image.blitFence, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -191,7 +179,7 @@ VkResult FormatConversion::blit(VkQueue queue, uint32_t imageIndex, uint32_t wai
     if (result != VK_SUCCESS) {
         return result;
     }
-    result = m_pDispatch->ResetFences(device, 1, &image.blitFence);
+    result = m_dispatch.ResetFences(device, 1, &image.blitFence);
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -207,7 +195,7 @@ VkResult FormatConversion::blit(VkQueue queue, uint32_t imageIndex, uint32_t wai
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &image.blitDone,
     };
-    result = m_pDispatch->QueueSubmit(queue, 1, &submitInfo, image.blitFence);
+    result = m_dispatch.QueueSubmit(queue, 1, &submitInfo, image.blitFence);
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -218,7 +206,7 @@ VkResult FormatConversion::blit(VkQueue queue, uint32_t imageIndex, uint32_t wai
 
 VkResult FormatConversion::createImage(const VkSwapchainCreateInfoKHR &createInfo, VkImage swapchainImage)
 {
-    const VkDevice device = m_pDispatch->Device;
+    const VkDevice device = m_dispatch.Device;
     Image &image = m_images.emplace_back(Image{ .swapchainImage = swapchainImage });
 
     const bool concurrent = createInfo.imageSharingMode == VK_SHARING_MODE_CONCURRENT;
@@ -237,14 +225,14 @@ VkResult FormatConversion::createImage(const VkSwapchainCreateInfoKHR &createInf
         .pQueueFamilyIndices = concurrent ? createInfo.pQueueFamilyIndices : nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
-    VkResult result = m_pDispatch->CreateImage(device, &imageInfo, nullptr, &image.image);
+    VkResult result = m_dispatch.CreateImage(device, &imageInfo, nullptr, &image.image);
     if (result != VK_SUCCESS) {
         return result;
     }
 
     VkMemoryRequirements requirements;
-    m_pDispatch->GetImageMemoryRequirements(device, image.image, &requirements);
-    const std::optional<uint32_t> memoryType = findMemoryType(m_pDispatch, requirements.memoryTypeBits);
+    m_dispatch.GetImageMemoryRequirements(device, image.image, &requirements);
+    const std::optional<uint32_t> memoryType = findMemoryType(m_dispatch, requirements.memoryTypeBits);
     if (!memoryType) {
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
@@ -254,23 +242,23 @@ VkResult FormatConversion::createImage(const VkSwapchainCreateInfoKHR &createInf
         .allocationSize = requirements.size,
         .memoryTypeIndex = *memoryType,
     };
-    result = m_pDispatch->AllocateMemory(device, &allocateInfo, nullptr, &image.memory);
+    result = m_dispatch.AllocateMemory(device, &allocateInfo, nullptr, &image.memory);
     if (result != VK_SUCCESS) {
         return result;
     }
-    result = m_pDispatch->BindImageMemory(device, image.image, image.memory, 0);
+    result = m_dispatch.BindImageMemory(device, image.image, image.memory, 0);
     if (result != VK_SUCCESS) {
         return result;
     }
 
     const VkSemaphoreCreateInfo semaphoreInfo{ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    result = m_pDispatch->CreateSemaphore(device, &semaphoreInfo, nullptr, &image.blitDone);
+    result = m_dispatch.CreateSemaphore(device, &semaphoreInfo, nullptr, &image.blitDone);
     if (result != VK_SUCCESS) {
         return result;
     }
 
     const VkFenceCreateInfo fenceInfo{ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT };
-    return m_pDispatch->CreateFence(device, &fenceInfo, nullptr, &image.blitFence);
+    return m_dispatch.CreateFence(device, &fenceInfo, nullptr, &image.blitFence);
 }
 
 VkResult FormatConversion::useQueue(VkQueue queue)
@@ -279,8 +267,8 @@ VkResult FormatConversion::useQueue(VkQueue queue)
         return VK_SUCCESS;
     }
 
-    const std::optional<uint32_t> queueFamily = findQueueFamily(m_pDispatch, queue);
-    if (!queueFamily || !supportsGraphics(m_pDispatch, *queueFamily)) {
+    const std::optional<uint32_t> queueFamily = findQueueFamily(m_dispatch, queue);
+    if (!queueFamily || !supportsGraphics(m_dispatch, *queueFamily)) {
         fprintf(stderr, "[HDR Layer] Can't convert the swapchain format, the present queue doesn't support graphics\n");
         return VK_ERROR_SURFACE_LOST_KHR;
     }
@@ -305,13 +293,13 @@ VkResult FormatConversion::createCommandBuffers(uint32_t queueFamily)
     }
     destroyCommandBuffers();
 
-    const VkDevice device = m_pDispatch->Device;
+    const VkDevice device = m_dispatch.Device;
     const VkCommandPoolCreateInfo poolInfo{
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = queueFamily,
     };
-    result = m_pDispatch->CreateCommandPool(device, &poolInfo, nullptr, &m_commandPool);
+    result = m_dispatch.CreateCommandPool(device, &poolInfo, nullptr, &m_commandPool);
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -324,7 +312,7 @@ VkResult FormatConversion::createCommandBuffers(uint32_t queueFamily)
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = uint32_t(commandBuffers.size()),
     };
-    result = m_pDispatch->AllocateCommandBuffers(device, &allocateInfo, commandBuffers.data());
+    result = m_dispatch.AllocateCommandBuffers(device, &allocateInfo, commandBuffers.data());
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -341,7 +329,7 @@ VkResult FormatConversion::createCommandBuffers(uint32_t queueFamily)
 
 void FormatConversion::destroyCommandBuffers()
 {
-    m_pDispatch->DestroyCommandPool(m_pDispatch->Device, m_commandPool, nullptr);
+    m_dispatch.DestroyCommandPool(m_dispatch.Device, m_commandPool, nullptr);
     m_commandPool = VK_NULL_HANDLE;
     m_queue = VK_NULL_HANDLE;
     for (Image &image : m_images) {
@@ -360,7 +348,7 @@ VkResult FormatConversion::waitForBlits() const
     if (fences.empty()) {
         return VK_SUCCESS;
     }
-    return m_pDispatch->WaitForFences(m_pDispatch->Device, uint32_t(fences.size()), fences.data(), VK_TRUE, UINT64_MAX);
+    return m_dispatch.WaitForFences(m_dispatch.Device, uint32_t(fences.size()), fences.data(), VK_TRUE, UINT64_MAX);
 }
 
 VkResult FormatConversion::recordBlit(const Image &image) const
@@ -369,7 +357,7 @@ VkResult FormatConversion::recordBlit(const Image &image) const
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    const VkResult result = m_pDispatch->BeginCommandBuffer(image.commandBuffer, &beginInfo);
+    const VkResult result = m_dispatch.BeginCommandBuffer(image.commandBuffer, &beginInfo);
     if (result != VK_SUCCESS) {
         return result;
     }
@@ -380,7 +368,7 @@ VkResult FormatConversion::recordBlit(const Image &image) const
         imageBarrier(image.swapchainImage, m_layers, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
     };
-    m_pDispatch->CmdPipelineBarrier(image.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+    m_dispatch.CmdPipelineBarrier(image.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                     0, nullptr, 0, nullptr, uint32_t(std::size(toTransfer)), toTransfer);
 
     const VkImageSubresourceLayers layers{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, m_layers };
@@ -391,7 +379,7 @@ VkResult FormatConversion::recordBlit(const Image &image) const
         .dstSubresource = layers,
         .dstOffsets = { {}, extent },
     };
-    m_pDispatch->CmdBlitImage(image.commandBuffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.swapchainImage,
+    m_dispatch.CmdBlitImage(image.commandBuffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.swapchainImage,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
 
     const VkImageMemoryBarrier toPresent[] = {
@@ -399,10 +387,10 @@ VkResult FormatConversion::recordBlit(const Image &image) const
         imageBarrier(image.swapchainImage, m_layers, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
     };
-    m_pDispatch->CmdPipelineBarrier(image.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+    m_dispatch.CmdPipelineBarrier(image.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
                                     0, nullptr, 0, nullptr, uint32_t(std::size(toPresent)), toPresent);
 
-    return m_pDispatch->EndCommandBuffer(image.commandBuffer);
+    return m_dispatch.EndCommandBuffer(image.commandBuffer);
 }
 
 }
