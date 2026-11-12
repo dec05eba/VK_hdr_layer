@@ -369,7 +369,8 @@ static VkResult getDriverSurfaceFormats(const vkroots::VkPhysicalDeviceDispatch 
     return result;
 }
 
-static std::vector<VkSurfaceFormatKHR> getHdrFormats(HdrSurfaceData &surface, const std::vector<VkSurfaceFormatKHR> &formats)
+static std::vector<VkSurfaceFormatKHR> getHdrFormats(const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice,
+                                                     HdrSurfaceData &surface, const std::vector<VkSurfaceFormatKHR> &formats)
 {
     surface.supportsPassthrough = std::ranges::any_of(formats, [](const VkSurfaceFormatKHR fmt) {
         return fmt.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT;
@@ -380,14 +381,20 @@ static std::vector<VkSurfaceFormatKHR> getHdrFormats(HdrSurfaceData &surface, co
         return hdrFormats;
     }
 
+    const auto hasFormat = [&formats](VkFormat format) {
+        return std::ranges::any_of(formats, [format](const VkSurfaceFormatKHR fmt) {
+            return fmt.format == format;
+        });
+    };
+
     for (const VkSurfaceFormatKHR &hdrFormat : s_HdrSurfaceFormats) {
         const bool alreadySupported = std::ranges::any_of(formats, [&hdrFormat](const VkSurfaceFormatKHR fmt) {
             return fmt.format == hdrFormat.format && fmt.colorSpace == hdrFormat.colorSpace;
         });
-        const bool hasFormat = std::ranges::any_of(formats, [&hdrFormat](const VkSurfaceFormatKHR fmt) {
-            return fmt.format == hdrFormat.format;
-        });
-        if (!alreadySupported && hasFormat) {
+        const bool presentable = hasFormat(hdrFormat.format)
+            || (hasFormat(FormatConversion::getPresentableFormat(hdrFormat.format))
+                && FormatConversion::canBlitToPresentable(dispatch, physicalDevice, hdrFormat.format));
+        if (!alreadySupported && presentable) {
             fprintf(stderr, "[HDR Layer] Enabling format: %u colorspace: %u\n", hdrFormat.format, hdrFormat.colorSpace);
             hdrFormats.push_back(hdrFormat);
         }
@@ -425,7 +432,7 @@ static VkResult getHdrSurfaceExtraFormats(const vkroots::VkPhysicalDeviceDispatc
         formats.insert(formats.end(), extraFormats.begin(), extraFormats.end());
     }
 
-    const std::vector<VkSurfaceFormatKHR> hdrFormats = getHdrFormats(hdrSurface, formats);
+    const std::vector<VkSurfaceFormatKHR> hdrFormats = getHdrFormats(dispatch, physicalDevice, hdrSurface, formats);
     extraFormats.insert(extraFormats.end(), hdrFormats.begin(), hdrFormats.end());
     return VK_SUCCESS;
 }

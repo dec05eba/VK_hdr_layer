@@ -14,6 +14,7 @@ class FormatConversion
 {
 public:
     static VkFormat getPresentableFormat(VkFormat format);
+    static bool canBlitToPresentable(const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice, VkFormat format);
     static bool canConvert(const vkroots::VkDeviceDispatch &dispatch, const VkSwapchainCreateInfoKHR &createInfo);
     static VkResult create(const vkroots::VkDeviceDispatch &dispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
                            const VkSwapchainCreateInfoKHR &createInfo, VkSwapchainKHR swapchain, std::unique_ptr<FormatConversion> &conversion);

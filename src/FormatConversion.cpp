@@ -81,24 +81,29 @@ VkFormat FormatConversion::getPresentableFormat(VkFormat format)
     return format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ? VK_FORMAT_A2R10G10B10_UNORM_PACK32 : format;
 }
 
-bool FormatConversion::canConvert(const vkroots::VkDeviceDispatch &dispatch, const VkSwapchainCreateInfoKHR &createInfo)
+bool FormatConversion::canBlitToPresentable(const vkroots::VkPhysicalDeviceDispatch &dispatch, VkPhysicalDevice physicalDevice, VkFormat format)
 {
-    const VkFormat presentableFormat = getPresentableFormat(createInfo.imageFormat);
-    if (presentableFormat == createInfo.imageFormat) {
+    const VkFormat presentableFormat = getPresentableFormat(format);
+    if (presentableFormat == format) {
         return false;
     }
 
+    VkFormatProperties source;
+    VkFormatProperties destination;
+    dispatch.GetPhysicalDeviceFormatProperties(physicalDevice, format, &source);
+    dispatch.GetPhysicalDeviceFormatProperties(physicalDevice, presentableFormat, &destination);
+    return (source.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (destination.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+}
+
+bool FormatConversion::canConvert(const vkroots::VkDeviceDispatch &dispatch, const VkSwapchainCreateInfoKHR &createInfo)
+{
     constexpr VkSwapchainCreateFlagsKHR unsupportedFlags = VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR | VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR
         | VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
     if ((createInfo.flags & unsupportedFlags) || vkroots::FindInChain<VkImageFormatListCreateInfo>(&createInfo)) {
         return false;
     }
 
-    VkFormatProperties source;
-    VkFormatProperties destination;
-    dispatch.GetPhysicalDeviceFormatProperties(dispatch.PhysicalDevice, createInfo.imageFormat, &source);
-    dispatch.GetPhysicalDeviceFormatProperties(dispatch.PhysicalDevice, presentableFormat, &destination);
-    return (source.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (destination.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    return canBlitToPresentable(*dispatch.pPhysicalDeviceDispatch, dispatch.PhysicalDevice, createInfo.imageFormat);
 }
 
 VkResult FormatConversion::create(const vkroots::VkDeviceDispatch &dispatch, PFN_vkSetDeviceLoaderData setDeviceLoaderData,
