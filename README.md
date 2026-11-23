@@ -60,5 +60,3 @@ Set the launch options in the game's Properties → General:
 - Proton games: `ENABLE_HDR_WSI=1 DXVK_HDR=1 %command%`. `DXVK_HDR=1` makes DXVK and vkd3d-proton report HDR support to the game.
 
 Then enable HDR in the game's settings.
-
-Direct3D 12 games run through vkd3d-proton, and upstream vkd3d-proton only creates HDR10 swapchains with `VK_FORMAT_A2B10G10R10_UNORM_PACK32`. Vulkan drivers don't offer that format for depth 30 X11 windows, so these games need a vkd3d-proton build that falls back to `VK_FORMAT_A2R10G10B10_UNORM_PACK32`, installed into the Proton build the game uses.
